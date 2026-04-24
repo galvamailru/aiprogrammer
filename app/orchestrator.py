@@ -313,6 +313,12 @@ class AgentOrchestrator:
                 storage.add_event(run_id, "deploy", "Deployment logs captured.", payload=logs.model_dump())
                 raise RuntimeError(item.stderr_tail or item.stdout_tail or "Remote deploy failed.")
 
+        runtime_checks = self.deployment.validate_remote_runtime(deploy_project_dir=deploy_project_dir)
+        for check in runtime_checks:
+            storage.add_event(run_id, "runtime", "Runtime validation step executed.", payload=check.model_dump())
+            if not check.ok:
+                raise RuntimeError(check.stderr_tail or check.stdout_tail or "Runtime validation failed.")
+
         health = self.deployment.healthcheck()
         storage.add_event(run_id, "health", "Healthcheck completed.", payload=health.model_dump())
         if not health.ok:

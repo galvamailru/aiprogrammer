@@ -43,6 +43,15 @@
   <script>
     let selectedRunId = null;
 
+    function eventClass(ev) {
+      const stage = (ev.stage || "").toLowerCase();
+      const payload = ev.payload || {};
+      if (stage === "error" || stage === "failed") return "event-failed";
+      if (payload.ok === false) return "event-failed";
+      if (stage === "done" || payload.ok === true) return "event-success";
+      return "event-neutral";
+    }
+
     async function api(url, options = {}) {
       const response = await fetch(url, options);
       if (!response.ok) {
@@ -106,7 +115,7 @@
       panel.className = "card";
       const events = run.events.map(ev => {
         const payload = Object.keys(ev.payload || {}).length ? `<pre>${JSON.stringify(ev.payload, null, 2)}</pre>` : "";
-        return `<li><b>[${ev.stage}]</b> ${ev.message}<small>${ev.ts}</small>${payload}</li>`;
+        return `<li class="${eventClass(ev)}"><b>[${ev.stage}]</b> ${ev.message}<small>${ev.ts}</small>${payload}</li>`;
       }).join("");
       panel.innerHTML = `
         <h3>Run details: ${run.run_id}</h3>

@@ -113,6 +113,16 @@ button:hover {
   padding: 8px;
 }
 
+.events li.event-success {
+  border-color: #166534;
+  background: #052e16;
+}
+
+.events li.event-failed {
+  border-color: #b91c1c;
+  background: #3f1212;
+}
+
 .events small {
   display: block;
   color: #94a3b8;
