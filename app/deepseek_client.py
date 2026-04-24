@@ -264,6 +264,8 @@ class DeepSeekClient:
             "If the error says a host port is mapped more than once, you MUST edit docker-compose (or compose.yml) so only one service publishes that host port "
             "(e.g. remove the duplicate ports: entry from nginx/frontend or change its published host port). "
             "Use 'docker compose' syntax (not docker-compose) when suggesting shell commands. "
+            "Execution order (orchestrator): every replace_text_in_file runs first; then git commit/push and server git pull + docker compose up (when auto_deploy); then run_remote_command actions in plan order; then validation_steps. "
+            "So remote shell commands always see the repository after your file edits—do not assume the server is stale relative to find_text. "
             "The section recent_repair_feedback lists failures from the current incident only (since the last successful repair). "
             "Do not repeat the same failed find_text or shell command unless you state what changed in the repo or on the host. "
             "If diagnosis is uncertain, first actions may be diagnostic run_remote_command steps that gather decisive facts. "

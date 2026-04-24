@@ -658,17 +658,16 @@ class AgentOrchestrator:
             architect_prompt=architect_prompt,
         )
 
-    async def _deploy_and_validate(self, run_id: str, git_url: str, deploy_project_dir: str) -> bool:
-        if not git_url:
-            raise RuntimeError("Deploy requires git_url from UI.")
+    def _deploy_remote_stack(self, run_id: str, git_url: str, deploy_project_dir: str, event_stage: str) -> None:
         deploy_results = self.deployment.deploy_remote(git_url=git_url, deploy_project_dir=deploy_project_dir)
         for item in deploy_results:
-            storage.add_event(run_id, "deploy", "Remote command executed.", payload=item.model_dump())
+            storage.add_event(run_id, event_stage, "Remote command executed.", payload=item.model_dump())
             if not item.ok:
                 logs = self.deployment.fetch_remote_logs(deploy_project_dir=deploy_project_dir)
-                storage.add_event(run_id, "deploy", "Deployment logs captured.", payload=logs.model_dump())
+                storage.add_event(run_id, event_stage, "Deployment logs captured.", payload=logs.model_dump())
                 raise RuntimeError(item.stderr_tail or item.stdout_tail or "Remote deploy failed.")
 
+    def _validate_deployed_stack(self, run_id: str, deploy_project_dir: str) -> None:
         runtime_checks = self.deployment.validate_remote_runtime(deploy_project_dir=deploy_project_dir)
         for check in runtime_checks:
             storage.add_event(run_id, "runtime", "Runtime validation step executed.", payload=check.model_dump())
@@ -681,10 +680,16 @@ class AgentOrchestrator:
             fallback = self.deployment.healthcheck_remote_backend_fallback(deploy_project_dir=deploy_project_dir)
             storage.add_event(run_id, "health", "Healthcheck fallback executed.", payload=fallback.model_dump())
             if fallback.ok:
-                return True
+                return
             logs = self.deployment.fetch_remote_logs(deploy_project_dir=deploy_project_dir)
             storage.add_event(run_id, "health", "Healthcheck failed, logs captured.", payload=logs.model_dump())
             raise RuntimeError(health.stderr_tail or "Healthcheck failed.")
+
+    async def _deploy_and_validate(self, run_id: str, git_url: str, deploy_project_dir: str) -> bool:
+        if not git_url:
+            raise RuntimeError("Deploy requires git_url from UI.")
+        self._deploy_remote_stack(run_id, git_url, deploy_project_dir, "deploy")
+        self._validate_deployed_stack(run_id, deploy_project_dir)
         return True
 
     async def _try_llm_repair(
@@ -725,31 +730,26 @@ class AgentOrchestrator:
             )
             return False
 
+        file_actions: list = []
+        remote_actions: list = []
         for action in plan.actions:
             action_type = (action.action_type or "").strip().lower()
-            if action_type == "run_remote_command":
-                cmd = action.command.strip()
-                if not cmd:
-                    storage.add_event(run_id, "repair", "Repair action rejected: empty remote command.", payload=action.model_dump())
-                    return False
-                result = self.runner.run_ssh(cmd, timeout_sec=900)
-                storage.add_event(run_id, "repair", "Repair action executed.", payload=result.model_dump())
-                if not result.ok:
-                    return False
-                continue
+            if action_type in {"replace_text_in_file", "update_healthcheck_url"}:
+                file_actions.append(action)
+            elif action_type in {"run_remote_command", "run_local_command", "ensure_postgres_db"}:
+                remote_actions.append(action)
+            else:
+                storage.add_event(
+                    run_id,
+                    "repair",
+                    "Unsupported repair action type.",
+                    {"action_type": action_type},
+                )
+                return False
 
-            if action_type == "run_local_command":
-                cmd = action.command.strip()
-                if not cmd:
-                    return False
-                # Safety fallback: in repair loop all diagnostics/treatment should be remote.
-                # If model still returns run_local_command, execute it remotely to avoid dead loops.
-                result = self.runner.run_ssh(cmd, timeout_sec=900)
-                storage.add_event(run_id, "repair", "Repair action executed.", payload=result.model_dump())
-                if not result.ok:
-                    return False
-                continue
-
+        had_successful_replace = False
+        for action in file_actions:
+            action_type = (action.action_type or "").strip().lower()
             if action_type == "replace_text_in_file":
                 normalized_path = self._normalize_repair_file_path(
                     file_path=action.file_path,
@@ -769,8 +769,8 @@ class AgentOrchestrator:
                 )
                 if not ok:
                     return False
+                had_successful_replace = True
                 continue
-
             if action_type == "update_healthcheck_url":
                 storage.add_event(
                     run_id,
@@ -778,6 +778,60 @@ class AgentOrchestrator:
                     "Healthcheck URL update requested; using remote fallback validation in current run.",
                     {"requested_target": action.target, "action_type": action_type},
                 )
+                continue
+
+        if had_successful_replace:
+            if not run.git_url:
+                storage.add_event(
+                    run_id,
+                    "repair",
+                    "Repair blocked: file patches require git_url to publish before remote commands run.",
+                )
+                return False
+            try:
+                self._run_git_flow(project_root, run_id, attempt=run.current_attempt or 1)
+            except RuntimeError as exc:
+                storage.add_event(run_id, "repair", "Repair git flow failed after file patches.", {"error": str(exc)})
+                return False
+            if settings.auto_deploy:
+                try:
+                    self._deploy_remote_stack(run_id, run.git_url, run.deploy_project_dir, "repair")
+                except RuntimeError as exc:
+                    storage.add_event(run_id, "repair", "Repair remote sync failed after push.", {"error": str(exc)})
+                    return False
+                storage.add_event(
+                    run_id,
+                    "repair",
+                    "Repair: local patches pushed; server pulled and compose rebuilt — next remote steps see new files.",
+                )
+            else:
+                storage.add_event(
+                    run_id,
+                    "repair",
+                    "Repair: pushed file patches; auto_deploy disabled — server compose not refreshed yet.",
+                )
+
+        for action in remote_actions:
+            action_type = (action.action_type or "").strip().lower()
+            if action_type == "run_remote_command":
+                cmd = action.command.strip()
+                if not cmd:
+                    storage.add_event(run_id, "repair", "Repair action rejected: empty remote command.", payload=action.model_dump())
+                    return False
+                result = self.runner.run_ssh(cmd, timeout_sec=900)
+                storage.add_event(run_id, "repair", "Repair action executed.", payload=result.model_dump())
+                if not result.ok:
+                    return False
+                continue
+
+            if action_type == "run_local_command":
+                cmd = action.command.strip()
+                if not cmd:
+                    return False
+                result = self.runner.run_ssh(cmd, timeout_sec=900)
+                storage.add_event(run_id, "repair", "Repair action executed.", payload=result.model_dump())
+                if not result.ok:
+                    return False
                 continue
 
             if action_type == "ensure_postgres_db":
@@ -825,12 +879,23 @@ class AgentOrchestrator:
                 )
                 return False
 
-        if run.git_url:
-            self._run_git_flow(project_root, run_id, attempt=run.current_attempt or 1)
+        if run.git_url and not had_successful_replace:
+            try:
+                self._run_git_flow(project_root, run_id, attempt=run.current_attempt or 1)
+            except RuntimeError as exc:
+                storage.add_event(run_id, "repair", "Repair git flow failed at finalize.", {"error": str(exc)})
+                return False
 
         if settings.auto_deploy:
-            if not await self._deploy_and_validate(run_id, run.git_url, run.deploy_project_dir):
+            try:
+                if had_successful_replace:
+                    self._validate_deployed_stack(run_id, run.deploy_project_dir)
+                else:
+                    await self._deploy_and_validate(run_id, run.git_url, run.deploy_project_dir)
+            except RuntimeError as exc:
+                storage.add_event(run_id, "repair", "Repair final validation failed.", {"error": str(exc)})
                 return False
+
         storage.add_event(run_id, "repair", "Repair feedback window cleared.", {})
         return True
 
