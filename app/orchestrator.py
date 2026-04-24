@@ -382,16 +382,26 @@ class AgentOrchestrator:
         if f"\"{health_port}:" not in compose_text and f"{health_port}:" not in compose_text:
             issues.append(f"Healthcheck port {health_port} is not exposed in docker-compose ports.")
 
-        # Check 2: DATABASE_URL host should map to existing service.
+        # Check 2: detect duplicate host-port mappings (bind conflict risk).
+        host_ports = re.findall(r"['\"]?(\d+)\s*:\s*\d+['\"]?", compose_text)
+        duplicates = sorted({port for port in host_ports if host_ports.count(port) > 1})
+        for dup in duplicates:
+            issues.append(f"Host port {dup} is mapped more than once in docker-compose services.")
+
+        # Check 3: DATABASE_URL host should map to existing service.
         db_url_match = re.search(r"DATABASE_URL:\s*([^\n]+)", compose_text)
         if db_url_match:
             db_url = db_url_match.group(1).strip().strip("'\"")
             host = ""
             db_name = ""
+            db_user = ""
             pg_match = re.search(r"postgres(?:ql)?://[^@]+@([^/:]+)(?::\d+)?/([a-zA-Z0-9_\-]+)", db_url)
             if pg_match:
                 host = pg_match.group(1)
                 db_name = pg_match.group(2)
+            user_match = re.search(r"postgres(?:ql)?://([^:@/]+)", db_url)
+            if user_match:
+                db_user = user_match.group(1)
             if host and not re.search(rf"^\s*{re.escape(host)}\s*:", compose_text, flags=re.M):
                 issues.append(f"DATABASE_URL host '{host}' has no matching service in docker-compose.")
             postgres_db_match = re.search(r"POSTGRES_DB:\s*([^\n]+)", compose_text)
@@ -401,12 +411,19 @@ class AgentOrchestrator:
                     issues.append(
                         f"DATABASE_URL db '{db_name}' differs from POSTGRES_DB '{postgres_db}'."
                     )
+            postgres_user_match = re.search(r"POSTGRES_USER:\s*([^\n]+)", compose_text)
+            if db_user and postgres_user_match:
+                postgres_user = postgres_user_match.group(1).strip().strip("'\"")
+                if postgres_user and postgres_user != db_user:
+                    issues.append(
+                        f"DATABASE_URL user '{db_user}' differs from POSTGRES_USER '{postgres_user}'."
+                    )
 
         if issues:
             storage.add_event(run_id, "consistency", "Consistency checks failed.", {"issues": issues})
             raise RuntimeError("Consistency checks failed: " + "; ".join(issues))
 
-        storage.add_event(run_id, "consistency", "Consistency checks passed.", {"checks": 3})
+        storage.add_event(run_id, "consistency", "Consistency checks passed.", {"checks": 4})
 
     def _format_generated_snapshots(self, snapshots: list[tuple[str, str]]) -> str:
         if not snapshots:
@@ -643,11 +660,13 @@ class AgentOrchestrator:
         project_root: Path,
     ) -> bool:
         runtime_facts = self._collect_runtime_facts(deploy_project_dir=run.deploy_project_dir)
+        recent_feedback = self._collect_recent_repair_feedback(run_id=run_id)
+        merged_runtime_facts = f"{runtime_facts}\n\n[recent_repair_feedback]\n{recent_feedback}".strip()
         plan: RepairPlan = await self.deepseek.propose_repair_plan(
             task_text=run.task_text,
             last_error=error_msg,
             context_md=context_md,
-            runtime_facts=runtime_facts,
+            runtime_facts=merged_runtime_facts,
         )
         storage.add_event(run_id, "repair", "LLM repair plan received.", payload=plan.model_dump())
         if not plan.actions:
@@ -670,6 +689,14 @@ class AgentOrchestrator:
                 cmd = action.command.strip()
                 if not cmd:
                     return False
+                if "docker compose" in cmd or "docker-compose" in cmd:
+                    storage.add_event(
+                        run_id,
+                        "repair",
+                        "Repair action rejected: docker compose should run remotely, not locally.",
+                        payload=action.model_dump(),
+                    )
+                    return False
                 result = self.runner.run_local(["sh", "-lc", cmd], cwd=project_root, timeout_sec=900)
                 storage.add_event(run_id, "repair", "Repair action executed.", payload=result.model_dump())
                 if not result.ok:
@@ -677,12 +704,21 @@ class AgentOrchestrator:
                 continue
 
             if action_type == "replace_text_in_file":
-                ok = self._apply_replace_text_action(project_root, action.file_path, action.find_text, action.replace_text)
+                normalized_path = self._normalize_repair_file_path(
+                    file_path=action.file_path,
+                    deploy_project_dir=run.deploy_project_dir,
+                )
+                ok = self._apply_replace_text_action(project_root, normalized_path, action.find_text, action.replace_text)
                 storage.add_event(
                     run_id,
                     "repair",
                     "Repair file patch applied.",
-                    {"ok": ok, "file_path": action.file_path, "action_type": action_type},
+                    {
+                        "ok": ok,
+                        "file_path": action.file_path,
+                        "normalized_file_path": normalized_path,
+                        "action_type": action_type,
+                    },
                 )
                 if not ok:
                     return False
@@ -718,12 +754,92 @@ class AgentOrchestrator:
             )
             return False
 
+        if plan.validation_steps:
+            checks_ok = self._execute_repair_validation_steps(
+                run_id=run_id,
+                deploy_project_dir=run.deploy_project_dir,
+                validation_steps=plan.validation_steps,
+            )
+            if not checks_ok:
+                return False
+
         if run.git_url:
             self._run_git_flow(project_root, run_id, attempt=run.current_attempt or 1)
 
         if settings.auto_deploy:
             return await self._deploy_and_validate(run_id, run.git_url, run.deploy_project_dir)
         return True
+
+    def _collect_recent_repair_feedback(self, run_id: str) -> str:
+        run_snapshot = storage.get_run(run_id)
+        failed_commands: list[str] = []
+        rejected_actions: list[str] = []
+        for ev in reversed(run_snapshot.events):
+            if ev.stage != "repair":
+                continue
+            payload = ev.payload or {}
+            if ev.message == "Repair action executed." and payload.get("ok") is False:
+                cmd = str(payload.get("command", "")).strip()
+                err = str(payload.get("stderr_tail", "")).strip()
+                if cmd:
+                    failed_commands.append(f"command={cmd} | stderr={err}")
+            if ev.message.startswith("Repair action rejected"):
+                rejected_actions.append(str(payload))
+            if len(failed_commands) >= 6 and len(rejected_actions) >= 4:
+                break
+        chunks = []
+        if failed_commands:
+            chunks.append("[failed_commands]\n" + "\n".join(f"- {item}" for item in failed_commands[:6]))
+        if rejected_actions:
+            chunks.append("[rejected_actions]\n" + "\n".join(f"- {item}" for item in rejected_actions[:4]))
+        if not chunks:
+            return "No previous failed/rejected repair actions."
+        return "\n\n".join(chunks)
+
+    def _execute_repair_validation_steps(
+        self,
+        run_id: str,
+        deploy_project_dir: str,
+        validation_steps: list[str],
+    ) -> bool:
+        for step in validation_steps:
+            cmd = self._extract_command_from_validation_step(step)
+            if not cmd:
+                storage.add_event(
+                    run_id,
+                    "repair",
+                    "Validation step skipped (no command parsed).",
+                    {"step": step},
+                )
+                continue
+            if cmd.startswith("curl ") or cmd.startswith("docker ") or cmd.startswith("docker-compose ") or cmd.startswith("docker compose "):
+                final_cmd = cmd
+            else:
+                final_cmd = f"cd \"{deploy_project_dir}\" && {cmd}"
+            result = self.runner.run_ssh(final_cmd, timeout_sec=180)
+            storage.add_event(
+                run_id,
+                "repair",
+                "Validation step executed.",
+                {"step": step, "command": final_cmd, "ok": result.ok, "stderr_tail": result.stderr_tail, "stdout_tail": result.stdout_tail},
+            )
+            if not result.ok:
+                return False
+        return True
+
+    def _extract_command_from_validation_step(self, step: str) -> str:
+        text = (step or "").strip()
+        if not text:
+            return ""
+        quote_match = re.search(r"[\"']([^\"']+)[\"']", text)
+        if quote_match:
+            return quote_match.group(1).strip()
+        lowered = text.lower()
+        prefixes = ("run ", "execute ")
+        for prefix in prefixes:
+            if lowered.startswith(prefix):
+                return text[len(prefix) :].strip()
+        return ""
 
     def _collect_runtime_facts(self, deploy_project_dir: str) -> str:
         facts: list[str] = []
@@ -747,6 +863,17 @@ class AgentOrchestrator:
         updated = content.replace(find_text, replace_text, 1)
         target.write_text(updated, encoding="utf-8")
         return True
+
+    def _normalize_repair_file_path(self, file_path: str, deploy_project_dir: str) -> str:
+        path = (file_path or "").strip()
+        if not path:
+            return path
+        if path.startswith("/"):
+            deploy_dir = (deploy_project_dir or "").rstrip("/")
+            if deploy_dir and path.startswith(f"{deploy_dir}/"):
+                return path[len(deploy_dir) + 1 :]
+            return path.lstrip("/")
+        return path
 
 
 orchestrator = AgentOrchestrator()

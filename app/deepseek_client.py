@@ -240,12 +240,19 @@ class DeepSeekClient:
 
         system_prompt = (
             "You are an autonomous SRE+backend repair agent. "
+            "Work in two phases: diagnose based on runtime facts, then propose treatment actions. "
             "Return strict JSON only (no markdown). "
             "Required top-level keys: diagnosis(string), confidence(number 0..1), actions(array), expected_outcome(string), validation_steps(array of strings). "
             "Each action must include: action_type, target, command, file_path, find_text, replace_text, reason. "
             "Allowed action_type values: run_remote_command, run_local_command, replace_text_in_file, update_healthcheck_url, ensure_postgres_db. "
+            "Prefer run_remote_command for deployment/runtime issues; use run_local_command only for local repository edits. "
+            "When editing files, file_path must be relative to repository root (e.g., docker-compose.yml), not absolute remote paths. "
+            "Use 'docker compose' syntax (not docker-compose) and avoid hardcoded container names when compose commands are possible. "
+            "Do not repeat commands that already failed in recent_repair_feedback unless you explain why the preconditions changed. "
+            "If diagnosis is uncertain, first actions should be diagnostic run_remote_command actions that gather decisive facts. "
             "For run_remote_command/run_local_command, command MUST be non-empty and executable as-is. "
             "For replace_text_in_file, provide file_path and exact find_text+replace_text. "
+            "Include explicit validation_steps as executable commands (quoted). "
             "Do not return empty actions unless no safe action exists."
         )
         user_prompt = (
