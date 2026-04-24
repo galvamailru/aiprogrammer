@@ -269,6 +269,7 @@ class DeepSeekClient:
         task_text: str,
         architecture_spec: str,
         deploy_project_dir: str,
+        runtime_gate_excerpt: str = "",
     ) -> DeployVerificationPlan:
         if not self._api_key:
             return DeployVerificationPlan(commands=[], rationale="No API key; skipping model-generated deploy verification.")
@@ -294,15 +295,28 @@ class DeepSeekClient:
             "until a path is justified by the spec. "
             "(3) For `docker compose exec SERVICE curl http://localhost:PORT/...`, PORT must match how that SERVICE listens inside its container per architecture / "
             "typical mapping in the spec (e.g. FastAPI uvicorn 8000)—never guess 3000 for a Python API container. "
-            "If curl may be missing in a slim image, prefer `wget -qO-` or hitting the published host port from ps instead of exec+curl. "
-            "(4) You may include `docker compose config --services` after ps; still no invented topology."
+            "Do not use `docker compose exec SERVICE` for a SERVICE that is not in `Up` state in RUNTIME_GATE_CAPTURE (compose ps step; use host-side curl to published ports, "
+            "or fix-oriented compose logs instead). Prefer `curl -fsS` on the deploy host to `http://127.0.0.1:<host_port>` from the PORTS column; "
+            "do not assume `wget` exists inside application containers unless the architecture or Dockerfile excerpt says so. "
+            "(4) You may include `docker compose config --services` after ps; still no invented topology. "
+            "(5) If RUNTIME_GATE_CAPTURE is present in the user message, treat it as authoritative ground truth from the server: "
+            "host port bindings and STATUS from the compose ps step, plus recent compose logs and any analyzer summary in that block. "
+            "Your verification commands must be consistent with that capture (do not invent ports or ignore visible errors)."
+        )
+        gate_block = (runtime_gate_excerpt or "").strip()
+        gate_section = (
+            "\n\n### RUNTIME_GATE_CAPTURE (full output of orchestrator pre-verify checks: docker compose ps -a, compose logs tail, log gate)\n"
+            f"```\n{gate_block[:24000]}\n```\n"
+            if gate_block
+            else ""
         )
         user_prompt = (
             f"Business task:\n{task_text}\n\n"
             f"Deploy directory on server (project root):\n{deploy_project_dir}\n\n"
-            f"Approved architecture specification (markdown):\n{architecture_spec[:60000]}\n\n"
+            f"Approved architecture specification (markdown):\n{architecture_spec[:60000]}\n"
+            f"{gate_section}\n"
             "Produce commands that prove the deployment works after docker compose up. "
-            "Anchor every curl URL to (a) host ports and service names shown by the first `docker compose ps` step in your own command list and "
+            "Anchor every curl URL to (a) host ports and service names from RUNTIME_GATE_CAPTURE / your first `docker compose ps` step and "
             "(b) HTTP paths that you can quote from the task or architecture above—no guessed frameworks."
         )
         raw = await self._chat(system_prompt, user_prompt)
@@ -322,7 +336,11 @@ class DeepSeekClient:
     async def review_and_fix_hint(self, task_text: str, last_error: str, context_md: str) -> str:
         if not self._api_key:
             return "Fallback review: inspect deployment logs and ensure docker compose services are healthy."
-        system_prompt = "You are a strict code reviewer. Return JSON with key: fix_hint."
+        system_prompt = (
+            "You are a strict code reviewer. Return JSON with key: fix_hint. "
+            "Address the primary failure in last_error (e.g. nginx not starting, 404 route mismatch, compose ps showing a service not Up). "
+            "Do not reduce the whole incident to a secondary tool missing (e.g. wget) unless last_error is only about that."
+        )
         user_prompt = (
             f"Task:\n{task_text}\n\nLast deployment or test error:\n{last_error}\n\nContext:\n{context_md}"
         )
@@ -351,7 +369,9 @@ class DeepSeekClient:
             "docker compose exec SERVICE cat PATH, curl -sS -D- (no body dump of huge binaries), nginx -t, ls, test -f. "
             "Forbidden: modifying files, git write, docker compose down, rm, volume wipes, redirects that overwrite files, kubectl delete. "
             "If runtime_facts (compose ps, logs) already pin the root cause, return commands: [] and explain in rationale. "
-            "When using docker compose from a project checkout, prefix with cd to that directory if the path appears in facts."
+            "When using docker compose from a project checkout, prefix with cd to that directory if the path appears in facts. "
+            "If [compose_ps] shows a service is not Up (exited / missing from running table), do NOT propose docker compose exec into that service; "
+            "read its config from the repo on the host (cat/grep paths under the deploy directory, e.g. frontend/nginx.conf) instead."
         )
         user_prompt = (
             f"Business task:\n{task_text}\n\n"
@@ -421,6 +441,9 @@ class DeepSeekClient:
             "For run_remote_command, command MUST be non-empty and executable as-is. "
             "For replace_text_in_file, replace_text is the replacement substring (use empty string only when intentionally removing find_text). "
             "validation_steps: concrete shell snippets (quoted) to prove the fix. "
+            "If compose_ps in runtime facts shows a service is not Up, validation_steps must NOT use docker compose exec into that service; "
+            "use curl from the host to 127.0.0.1 and the host port from the PORTS column, or docker compose logs for that service. "
+            "Host ports in validation_steps must match the PORTS column from compose_ps—never invent a port. "
             "Do not return empty actions unless no safe action exists."
         )
         user_prompt = (

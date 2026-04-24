@@ -10,7 +10,7 @@ from pathlib import Path
 from .config import settings
 from .deepseek_client import DeepSeekClient
 from .deployment import DeploymentService
-from .models import AgentRun, CodePlan, RepairPlan, RunStatus
+from .models import AgentRun, CodePlan, CommandResult, RepairPlan, RunStatus
 from .storage import storage
 from .terminal_runner import TerminalRunner
 
@@ -725,6 +725,22 @@ class AgentOrchestrator:
                 storage.add_event(run_id, event_stage, "Deployment logs captured.", payload=logs.model_dump())
                 raise RuntimeError(item.stderr_tail or item.stdout_tail or "Remote deploy failed.")
 
+    def _runtime_gate_excerpt_for_deploy_verify(self, checks: list[CommandResult], max_chars: int = 24000) -> str:
+        """Concatenate all remote runtime gate steps (ps, logs, analyzer) for the deploy-verify model."""
+        chunks: list[str] = []
+        for i, check in enumerate(checks, start=1):
+            cmd = (check.command or "").strip()
+            chunks.append(
+                f"### runtime_gate step {i}\n"
+                f"command: {cmd}\nsource: {check.source}\nok: {check.ok} exit_code: {check.exit_code}\n"
+                f"--- stdout_tail ---\n{check.stdout_tail or ''}\n"
+                f"--- stderr_tail ---\n{check.stderr_tail or ''}\n"
+            )
+        text = "\n".join(chunks).strip()
+        if len(text) <= max_chars:
+            return text
+        return text[:max_chars] + "\n...[truncated]\n"
+
     def _wrap_deploy_verify_command(self, snippet: str, deploy_project_dir: str) -> str:
         cmd = (snippet or "").strip()
         if not cmd:
@@ -742,10 +758,13 @@ class AgentOrchestrator:
             if not check.ok:
                 raise RuntimeError(check.stderr_tail or check.stdout_tail or "Runtime validation failed.")
 
+        runtime_gate_excerpt = self._runtime_gate_excerpt_for_deploy_verify(runtime_checks)
+
         plan = await self.deepseek.propose_deploy_verification_commands(
             task_text=run.task_text,
             architecture_spec=run.architecture_spec or "",
             deploy_project_dir=deploy_project_dir,
+            runtime_gate_excerpt=runtime_gate_excerpt,
         )
         storage.add_event(
             run_id,
@@ -1123,7 +1142,7 @@ class AgentOrchestrator:
 
     def _collect_runtime_facts(self, deploy_project_dir: str) -> str:
         facts: list[str] = []
-        ps = self.runner.run_ssh(f"cd \"{deploy_project_dir}\" && docker compose ps", timeout_sec=120)
+        ps = self.runner.run_ssh(f"cd \"{deploy_project_dir}\" && docker compose ps -a", timeout_sec=120)
         logs = self.deployment.fetch_remote_logs(deploy_project_dir=deploy_project_dir)
         facts.append(f"[compose_ps]\n{ps.stdout_tail}\n{ps.stderr_tail}")
         facts.append(f"[compose_logs]\n{logs.stdout_tail}\n{logs.stderr_tail}")

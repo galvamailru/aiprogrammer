@@ -85,7 +85,7 @@ class DeploymentService:
         safe_dir = deploy_project_dir.replace('"', "")
         checks: list[CommandResult] = []
 
-        ps_result = self.runner.run_ssh(f"cd \"{safe_dir}\" && docker compose ps", timeout_sec=120)
+        ps_result = self.runner.run_ssh(f"cd \"{safe_dir}\" && docker compose ps -a", timeout_sec=120)
         checks.append(ps_result)
         if not ps_result.ok:
             return checks
@@ -118,6 +118,8 @@ class DeploymentService:
             "connection refused",
             "name or service not known",
             "could not translate host name",
+            "nginx: [emerg]",
+            "duplicate location",
         ]
         if any(signature in log_text for signature in error_signatures):
             checks.append(
