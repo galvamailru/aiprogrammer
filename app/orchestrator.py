@@ -116,14 +116,12 @@ class AgentOrchestrator:
             except Exception as exc:
                 error_msg = str(exc)
                 storage.add_event(run_id, "error", "Pipeline step failed.", {"error": error_msg})
-                remediation_applied = self._try_auto_remediation(
-                    run_id=run_id,
-                    error_msg=error_msg,
-                    deploy_project_dir=run.deploy_project_dir,
+                storage.add_event(
+                    run_id,
+                    "repair",
+                    "Expert repair agent invoked (JSON action plan mode).",
+                    {"source": "llm_expert"},
                 )
-                if remediation_applied:
-                    storage.add_event(run_id, "remediation", "Auto-remediation succeeded. Continuing without regeneration.")
-                    continue
                 llm_repair_applied = await self._try_llm_repair(
                     run_id=run_id,
                     run=run,
@@ -475,41 +473,6 @@ class AgentOrchestrator:
             raise RuntimeError(health.stderr_tail or "Healthcheck failed.")
         return True
 
-    def _try_auto_remediation(self, run_id: str, error_msg: str, deploy_project_dir: str) -> bool:
-        rule = self.deployment.detect_remediation_rule(error_msg)
-        if not rule:
-            storage.add_event(run_id, "remediation", "No remediation rule matched.")
-            return False
-
-        storage.add_event(
-            run_id,
-            "remediation",
-            "Matched remediation rule.",
-            {"rule_id": rule["id"], "action": rule["action"]},
-        )
-        actions = self.deployment.run_remediation(rule_id=rule["id"], deploy_project_dir=deploy_project_dir)
-        if not actions:
-            return False
-        for action_result in actions:
-            storage.add_event(run_id, "remediation", "Remediation command executed.", payload=action_result.model_dump())
-            if not action_result.ok:
-                return False
-
-        runtime_checks = self.deployment.validate_remote_runtime(deploy_project_dir=deploy_project_dir)
-        for check in runtime_checks:
-            storage.add_event(run_id, "remediation", "Post-remediation runtime check.", payload=check.model_dump())
-            if not check.ok:
-                return False
-
-        health = self.deployment.healthcheck_remote(deploy_project_dir=deploy_project_dir)
-        storage.add_event(run_id, "remediation", "Post-remediation healthcheck.", payload=health.model_dump())
-        if health.ok:
-            return True
-
-        fallback = self.deployment.healthcheck_remote_backend_fallback(deploy_project_dir=deploy_project_dir)
-        storage.add_event(run_id, "remediation", "Post-remediation fallback healthcheck.", payload=fallback.model_dump())
-        return fallback.ok
-
     async def _try_llm_repair(
         self,
         run_id: str,
@@ -567,6 +530,19 @@ class AgentOrchestrator:
                     "Healthcheck URL update requested; using remote fallback validation in current run.",
                     {"requested_target": action.target, "action_type": action_type},
                 )
+                continue
+
+            if action_type == "ensure_postgres_db":
+                db_name = (action.target or "taskcalendar").strip()
+                cmd = (
+                    "cd \"{dir}\" && docker compose exec -T db sh -lc "
+                    "\"psql -U $POSTGRES_USER -d postgres -tc \\\"SELECT 1 FROM pg_database WHERE datname='{db}'\\\" "
+                    "| grep -q 1 || psql -U $POSTGRES_USER -d postgres -c \\\"CREATE DATABASE {db};\\\"\""
+                ).format(dir=run.deploy_project_dir, db=db_name)
+                result = self.runner.run_ssh(cmd, timeout_sec=300)
+                storage.add_event(run_id, "repair", "Repair action executed.", payload=result.model_dump())
+                if not result.ok:
+                    return False
                 continue
 
             storage.add_event(

@@ -62,6 +62,60 @@
       return "event-neutral";
     }
 
+    function extractLatestRepairPlan(events) {
+      for (let i = events.length - 1; i >= 0; i -= 1) {
+        const ev = events[i];
+        const payload = ev.payload || {};
+        if (payload && typeof payload === "object" && "diagnosis" in payload && "actions" in payload) {
+          return payload;
+        }
+      }
+      return null;
+    }
+
+    function renderRepairPlan(plan) {
+      if (!plan) {
+        return `<div class="repair-plan-empty">Repair Plan is not available yet.</div>`;
+      }
+      const confidence = Number.isFinite(Number(plan.confidence))
+        ? `${Math.round(Number(plan.confidence) * 100)}%`
+        : "-";
+      const actions = Array.isArray(plan.actions) ? plan.actions : [];
+      const validationSteps = Array.isArray(plan.validation_steps) ? plan.validation_steps : [];
+
+      const actionsHtml = actions.length
+        ? `<ol class="repair-plan-list">${
+            actions.map((action) => `
+              <li>
+                <div><b>Type:</b> ${action.action_type || "-"}</div>
+                <div><b>Target:</b> ${action.target || "-"}</div>
+                <div><b>Command:</b> <code>${action.command || "-"}</code></div>
+                <div><b>File:</b> ${action.file_path || "-"}</div>
+                <div><b>Reason:</b> ${action.reason || "-"}</div>
+              </li>
+            `).join("")
+          }</ol>`
+        : `<div class="repair-plan-empty">No actions provided by model.</div>`;
+
+      const validationHtml = validationSteps.length
+        ? `<ul class="repair-plan-validation">${
+            validationSteps.map((step) => `<li>${step}</li>`).join("")
+          }</ul>`
+        : `<div class="repair-plan-empty">No validation steps.</div>`;
+
+      return `
+        <div class="repair-plan-block">
+          <p><b>Diagnosis:</b> ${plan.diagnosis || "-"}</p>
+          <p><b>Confidence:</b> ${confidence}</p>
+          <p><b>Expected outcome:</b> ${plan.expected_outcome || "-"}</p>
+          <h4>Actions</h4>
+          ${actionsHtml}
+          <h4>Validation steps</h4>
+          ${validationHtml}
+        </div>
+      `;
+    }
+
     async function api(url, options = {}) {
       const response = await fetch(url, options);
       if (!response.ok) {
@@ -124,6 +178,7 @@
       const panel = document.createElement("article");
       panel.id = "run-details";
       panel.className = "card";
+      const latestRepairPlan = extractLatestRepairPlan(run.events || []);
       const events = run.events.map(ev => {
         const payload = Object.keys(ev.payload || {}).length ? `<pre>${JSON.stringify(ev.payload, null, 2)}</pre>` : "";
         return `<li class="${eventClass(ev)}"><b>[${ev.stage}]</b> ${ev.message}<small>${ev.ts}</small>${payload}</li>`;
@@ -131,6 +186,9 @@
       panel.innerHTML = `
         <h3>Run details: ${run.run_id}</h3>
         <p><b>Repo context mode:</b> ${run.use_repo_context ? "ON (review/change pulled code)" : "OFF (generate from scratch context)"}</p>
+        <h3>Repair Plan</h3>
+        ${renderRepairPlan(latestRepairPlan)}
+        <h3>Events</h3>
         <ul class="events">${events || "<li>No events yet</li>"}</ul>
       `;
       document.querySelector(".container").appendChild(panel);

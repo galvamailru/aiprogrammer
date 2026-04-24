@@ -47,6 +47,21 @@ class DeepSeekClient:
             data = response.json()
             return data["choices"][0]["message"]["content"]
 
+    def _parse_json_relaxed(self, raw: str) -> dict[str, Any] | None:
+        try:
+            return json.loads(raw)
+        except Exception:
+            pass
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            snippet = raw[start : end + 1]
+            try:
+                return json.loads(snippet)
+            except Exception:
+                return None
+        return None
+
     async def build_code_plan(self, task_text: str, context_md: str) -> CodePlan:
         if not self._api_key:
             return self._fallback_code_plan(task_text)
@@ -182,7 +197,7 @@ class DeepSeekClient:
             "You are an autonomous SRE+backend repair agent. "
             "Return strict JSON with keys: diagnosis, confidence, actions, expected_outcome, validation_steps. "
             "actions is array of objects with keys: action_type, target, command, file_path, find_text, replace_text, reason. "
-            "Allowed action_type values: run_remote_command, run_local_command, replace_text_in_file, update_healthcheck_url. "
+            "Allowed action_type values: run_remote_command, run_local_command, replace_text_in_file, update_healthcheck_url, ensure_postgres_db. "
             "Prefer minimal reversible changes."
         )
         user_prompt = (
@@ -193,14 +208,23 @@ class DeepSeekClient:
             "Generate a repair plan."
         )
         raw = await self._chat(system_prompt, user_prompt)
-        try:
-            parsed: dict[str, Any] = json.loads(raw)
-            return RepairPlan(**parsed)
-        except Exception:
-            return RepairPlan(
-                diagnosis="Failed to parse repair plan JSON.",
-                confidence=0.1,
-                actions=[],
-                expected_outcome="No executable repair actions.",
-                validation_steps=[],
+        parsed = self._parse_json_relaxed(raw)
+        if parsed is None:
+            retry_prompt = (
+                user_prompt
+                + "\n\nReturn ONLY valid JSON object. Do not use markdown, prose, or code fences."
             )
+            raw_retry = await self._chat(system_prompt, retry_prompt)
+            parsed = self._parse_json_relaxed(raw_retry)
+        if parsed is not None:
+            try:
+                return RepairPlan(**parsed)
+            except Exception:
+                pass
+        return RepairPlan(
+            diagnosis="Failed to parse repair plan JSON.",
+            confidence=0.1,
+            actions=[],
+            expected_outcome="No executable repair actions.",
+            validation_steps=[],
+        )

@@ -135,3 +135,34 @@ pre {
   border-radius: 6px;
   padding: 8px;
 }
+
+.repair-plan-block {
+  background: #0b1220;
+  border: 1px solid #1e293b;
+  border-radius: 8px;
+  padding: 10px;
+  margin-bottom: 14px;
+}
+
+.repair-plan-list,
+.repair-plan-validation {
+  margin: 0 0 10px 18px;
+  padding: 0;
+}
+
+.repair-plan-list li,
+.repair-plan-validation li {
+  margin-bottom: 6px;
+}
+
+.repair-plan-empty {
+  color: #94a3b8;
+  margin-bottom: 10px;
+}
+
+code {
+  background: #020617;
+  border: 1px solid #334155;
+  border-radius: 4px;
+  padding: 1px 5px;
+}
