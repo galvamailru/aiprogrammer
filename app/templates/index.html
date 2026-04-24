@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI Programmer</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <main class="container">
+    <h1>AI Programmer</h1>
+    <p class="subtitle">Business task -> planning -> code -> deploy -> auto-fix loop</p>
+
+    <section class="card">
+      <h2>1. Upload markdown context</h2>
+      <form id="upload-form">
+        <input type="file" id="context-file" accept=".md" required>
+        <button type="submit">Upload .md</button>
+      </form>
+      <ul id="context-list"></ul>
+    </section>
+
+    <section class="card">
+      <h2>2. Enter business task</h2>
+      <form id="task-form">
+        <label for="git-url">Git repository URL</label>
+        <input type="url" id="git-url" placeholder="https://github.com/owner/repo.git" required>
+        <label for="deploy-dir">Deploy directory on Linux server</label>
+        <input type="text" id="deploy-dir" placeholder="/opt/myapp" required>
+        <textarea id="task-text" rows="8" placeholder="Describe business task and expected outcome..." required></textarea>
+        <button type="submit">Start agent cycle</button>
+      </form>
+    </section>
+
+    <section class="card">
+      <h2>3. Runs</h2>
+      <div id="runs"></div>
+    </section>
+  </main>
+
+  <script>
+    let selectedRunId = null;
+
+    async function api(url, options = {}) {
+      const response = await fetch(url, options);
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(text || "Request failed");
+      }
+      return response.json();
+    }
+
+    async function loadContextDocs() {
+      const docs = await api("/api/context");
+      const list = document.getElementById("context-list");
+      list.innerHTML = "";
+      docs.forEach(doc => {
+        const li = document.createElement("li");
+        li.textContent = doc.name;
+        list.appendChild(li);
+      });
+    }
+
+    async function loadRuns() {
+      const runs = await api("/api/runs");
+      const container = document.getElementById("runs");
+      container.innerHTML = "";
+      runs.sort((a, b) => (a.created_at < b.created_at ? 1 : -1));
+      runs.forEach(run => {
+        const card = document.createElement("article");
+        card.className = "run";
+        if (selectedRunId === run.run_id) {
+          card.classList.add("selected");
+        }
+        card.innerHTML = `
+          <header>
+            <strong>${run.run_id}</strong>
+            <span class="status status-${run.status}">${run.status}</span>
+          </header>
+          <p><b>Attempt:</b> ${run.current_attempt}/${run.max_attempts}</p>
+          <p><b>Git:</b> ${run.git_url || "-"}</p>
+          <p><b>Deploy dir:</b> ${run.deploy_project_dir || "-"}</p>
+          <p>${run.task_text}</p>
+        `;
+        card.onclick = async () => {
+          selectedRunId = run.run_id;
+          await loadRuns();
+          await loadRunDetails(run.run_id);
+        };
+        container.appendChild(card);
+      });
+      if (selectedRunId) {
+        await loadRunDetails(selectedRunId);
+      }
+    }
+
+    async function loadRunDetails(runId) {
+      const run = await api(`/api/runs/${runId}`);
+      const old = document.getElementById("run-details");
+      if (old) old.remove();
+
+      const panel = document.createElement("article");
+      panel.id = "run-details";
+      panel.className = "card";
+      const events = run.events.map(ev => {
+        const payload = Object.keys(ev.payload || {}).length ? `<pre>${JSON.stringify(ev.payload, null, 2)}</pre>` : "";
+        return `<li><b>[${ev.stage}]</b> ${ev.message}<small>${ev.ts}</small>${payload}</li>`;
+      }).join("");
+      panel.innerHTML = `
+        <h3>Run details: ${run.run_id}</h3>
+        <ul class="events">${events || "<li>No events yet</li>"}</ul>
+      `;
+      document.querySelector(".container").appendChild(panel);
+    }
+
+    document.getElementById("upload-form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const input = document.getElementById("context-file");
+      if (!input.files.length) return;
+      const data = new FormData();
+      data.append("file", input.files[0]);
+      await api("/api/context/upload", { method: "POST", body: data });
+      input.value = "";
+      await loadContextDocs();
+    });
+
+    document.getElementById("task-form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const taskText = document.getElementById("task-text").value.trim();
+      const gitUrl = document.getElementById("git-url").value.trim();
+      const deployDir = document.getElementById("deploy-dir").value.trim();
+      if (!taskText || !gitUrl || !deployDir) return;
+      const payload = JSON.stringify({
+        task_text: taskText,
+        git_url: gitUrl,
+        deploy_project_dir: deployDir
+      });
+      const result = await api("/api/runs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: payload
+      });
+      selectedRunId = result.run_id;
+      await loadRuns();
+    });
+
+    async function bootstrap() {
+      const config = await api("/api/config");
+      document.getElementById("deploy-dir").value = config.deploy_project_dir || "";
+      await loadContextDocs();
+      await loadRuns();
+      setInterval(loadRuns, 3000);
+    }
+
+    bootstrap().catch(err => alert(err.message));
+  </script>
+</body>
+</html>

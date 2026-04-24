@@ -1,0 +1,13 @@
+services:
+  aiprogrammer:
+    build: .
+    container_name: aiprogrammer
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    volumes:
+      - ./uploads:/app/uploads
+      - ./runs:/app/runs
+      - ./target_project:/app/target_project
