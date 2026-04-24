@@ -51,8 +51,35 @@ class AgentOrchestrator:
                 {"chars": len(architecture_spec)},
             )
         storage.update_status(run.run_id, RunStatus.running)
-        asyncio.create_task(self._run_pipeline(run.run_id))
+        task = asyncio.create_task(self._run_pipeline(run.run_id))
+        task.add_done_callback(lambda t, rid=run.run_id: self._on_pipeline_done(rid, t))
         return run
+
+    def _on_pipeline_done(self, run_id: str, task: asyncio.Task) -> None:
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            storage.update_status(run_id, RunStatus.failed)
+            storage.add_event(run_id, "failed", "Pipeline task was cancelled.")
+            return
+        except Exception as callback_exc:
+            storage.update_status(run_id, RunStatus.failed)
+            storage.add_event(
+                run_id,
+                "failed",
+                "Pipeline task completion callback failed.",
+                {"error": str(callback_exc)},
+            )
+            return
+
+        if exc is not None:
+            storage.update_status(run_id, RunStatus.failed)
+            storage.add_event(
+                run_id,
+                "failed",
+                "Pipeline crashed with unhandled exception.",
+                {"error": str(exc)},
+            )
 
     async def _run_pipeline(self, run_id: str) -> None:
         run = storage.get_run(run_id)
@@ -166,17 +193,26 @@ class AgentOrchestrator:
                     "Expert repair agent invoked (JSON action plan mode).",
                     {"source": "llm_expert"},
                 )
-                llm_repair_applied = await self._try_llm_repair(
-                    run_id=run_id,
-                    run=run,
-                    error_msg=error_msg,
-                    context_md=(
-                        f"{context_md}\n\n## Last attempt fix directive (must follow)\n{last_fix_hint}".strip()
-                        if last_fix_hint
-                        else context_md
-                    ),
-                    project_root=project_root,
-                )
+                try:
+                    llm_repair_applied = await self._try_llm_repair(
+                        run_id=run_id,
+                        run=run,
+                        error_msg=error_msg,
+                        context_md=(
+                            f"{context_md}\n\n## Last attempt fix directive (must follow)\n{last_fix_hint}".strip()
+                            if last_fix_hint
+                            else context_md
+                        ),
+                        project_root=project_root,
+                    )
+                except Exception as repair_exc:
+                    llm_repair_applied = False
+                    storage.add_event(
+                        run_id,
+                        "repair",
+                        "LLM repair pipeline failed with exception.",
+                        {"error": str(repair_exc)},
+                    )
                 if llm_repair_applied:
                     storage.update_status(run_id, RunStatus.completed)
                     storage.add_event(run_id, "done", "Run completed successfully after LLM repair.")
@@ -671,6 +707,24 @@ class AgentOrchestrator:
         storage.add_event(run_id, "repair", "LLM repair plan received.", payload=plan.model_dump())
         if not plan.actions:
             return False
+        if not self._has_treatment_action(plan.actions):
+            storage.add_event(
+                run_id,
+                "repair",
+                "Repair plan rejected: no treatment action (diagnostics-only plan).",
+                {"actions": [a.model_dump() for a in plan.actions]},
+            )
+            return False
+
+        duplicate_port = self._extract_duplicate_port_issue(error_msg)
+        if duplicate_port and not self._has_compose_fix_action(plan.actions):
+            storage.add_event(
+                run_id,
+                "repair",
+                "Repair plan rejected: duplicate port conflict requires compose fix action.",
+                {"required_port": duplicate_port},
+            )
+            return False
 
         for action in plan.actions:
             action_type = (action.action_type or "").strip().lower()
@@ -757,6 +811,21 @@ class AgentOrchestrator:
             if not checks_ok:
                 return False
 
+        if duplicate_port:
+            compose_ok = self._assert_single_host_port_mapping(
+                project_root=project_root,
+                run_id=run_id,
+                host_port=duplicate_port,
+            )
+            if not compose_ok:
+                storage.add_event(
+                    run_id,
+                    "repair",
+                    "Repair post-condition failed: duplicate host port mapping still exists.",
+                    {"port": duplicate_port},
+                )
+                return False
+
         if run.git_url:
             self._run_git_flow(project_root, run_id, attempt=run.current_attempt or 1)
 
@@ -833,7 +902,8 @@ class AgentOrchestrator:
         for prefix in prefixes:
             if lowered.startswith(prefix):
                 return text[len(prefix) :].strip()
-        return ""
+        # If it's already a raw shell command (most model outputs), execute as-is.
+        return text
 
     def _collect_runtime_facts(self, deploy_project_dir: str) -> str:
         facts: list[str] = []
@@ -868,6 +938,83 @@ class AgentOrchestrator:
                 return path[len(deploy_dir) + 1 :]
             return path.lstrip("/")
         return path
+
+    def _has_treatment_action(self, actions: list) -> bool:
+        diagnostic_prefixes = (
+            "cat ",
+            "grep ",
+            "rg ",
+            "docker ps",
+            "docker compose ps",
+            "docker compose logs",
+            "docker compose config",
+            "ss ",
+            "netstat ",
+        )
+        for action in actions:
+            action_type = (action.action_type or "").strip().lower()
+            if action_type == "replace_text_in_file":
+                if (action.replace_text or "").strip():
+                    return True
+                continue
+            if action_type == "ensure_postgres_db":
+                return True
+            if action_type == "update_healthcheck_url":
+                return True
+            if action_type in {"run_remote_command", "run_local_command"}:
+                cmd = (action.command or "").strip().lower()
+                if not cmd:
+                    continue
+                if any(cmd.startswith(prefix) for prefix in diagnostic_prefixes):
+                    continue
+                return True
+        return False
+
+    def _extract_duplicate_port_issue(self, error_msg: str) -> int | None:
+        text = (error_msg or "").lower()
+        if "host port" in text and "mapped more than once" in text:
+            match = re.search(r"host port\s+(\d+)", text)
+            if match:
+                try:
+                    return int(match.group(1))
+                except ValueError:
+                    return None
+        return None
+
+    def _has_compose_fix_action(self, actions: list) -> bool:
+        for action in actions:
+            action_type = (action.action_type or "").strip().lower()
+            if action_type == "replace_text_in_file":
+                file_path = (action.file_path or "").lower()
+                if "docker-compose" in file_path or file_path.endswith("compose.yml"):
+                    return True
+            if action_type in {"run_remote_command", "run_local_command"}:
+                cmd = (action.command or "").lower()
+                if ("docker-compose.yml" in cmd or "docker compose" in cmd) and any(
+                    token in cmd for token in ("sed ", "awk ", "perl ", "python ", "yq ", "tee ")
+                ):
+                    return True
+        return False
+
+    def _assert_single_host_port_mapping(self, project_root: Path, run_id: str, host_port: int) -> bool:
+        compose_file = project_root / "docker-compose.yml"
+        if not compose_file.exists():
+            storage.add_event(
+                run_id,
+                "repair",
+                "Post-condition check skipped: docker-compose.yml missing in project root.",
+            )
+            return False
+        content = compose_file.read_text(encoding="utf-8")
+        host_ports = re.findall(r"['\"]?(\d+)\s*:\s*\d+['\"]?", content)
+        count = sum(1 for port in host_ports if port == str(host_port))
+        storage.add_event(
+            run_id,
+            "repair",
+            "Post-condition check executed for compose host-port uniqueness.",
+            {"port": host_port, "count": count},
+        )
+        return count == 1
 
 
 orchestrator = AgentOrchestrator()
