@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import tempfile
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 from .config import settings
 from .deepseek_client import DeepSeekClient
@@ -65,14 +67,15 @@ class AgentOrchestrator:
         storage.add_event(run_id, "pipeline", "Pipeline started.", {"project_root": str(project_root)})
         self._prepare_local_repo(project_root=project_root, git_url=run.git_url, run_id=run_id)
         repo_context_md = self._build_repo_context(project_root, run.use_repo_context)
+        invariants_md = self._build_invariants_context()
         if repo_context_md:
             storage.add_event(
                 run_id,
                 "context",
                 "Repository context extracted for model.",
-                {"chars": len(repo_context_md), "enabled": run.use_repo_context},
+                {"chars": len(repo_context_md), "enabled": run.use_repo_context, "invariants": True},
             )
-            context_md = f"{context_md}\n\n## Pulled repository context\n{repo_context_md}".strip()
+            context_md = f"{context_md}\n\n## System invariants\n{invariants_md}\n\n## Pulled repository context\n{repo_context_md}".strip()
         else:
             storage.add_event(
                 run_id,
@@ -80,11 +83,49 @@ class AgentOrchestrator:
                 "Repository context disabled or unavailable; generation starts from task/context docs.",
                 {"enabled": run.use_repo_context},
             )
+            context_md = f"{context_md}\n\n## System invariants\n{invariants_md}".strip()
+
+        repair_only_mode = False
+        last_error_msg = ""
+        last_fix_hint = ""
 
         for attempt in range(1, run.max_attempts + 1):
             storage.set_attempt(run_id, attempt)
             storage.add_event(run_id, "attempt", f"Attempt {attempt}/{run.max_attempts} started.")
             try:
+                if repair_only_mode and attempt > 1:
+                    storage.add_event(
+                        run_id,
+                        "repair",
+                        "Repair-only mode active: skipping planning/codegen and applying targeted fixes.",
+                        {"attempt": attempt},
+                    )
+                    repair_context_md = context_md
+                    if last_fix_hint:
+                        repair_context_md = (
+                            f"{repair_context_md}\n\n## Last attempt fix directive (must follow)\n{last_fix_hint}"
+                        ).strip()
+                    error_for_repair = (
+                        last_error_msg
+                        or "Previous attempt failed. Apply minimal targeted repair and revalidate."
+                    )
+                    llm_repair_applied = await self._try_llm_repair(
+                        run_id=run_id,
+                        run=run,
+                        error_msg=error_for_repair,
+                        context_md=repair_context_md,
+                        project_root=project_root,
+                    )
+                    if llm_repair_applied:
+                        storage.update_status(run_id, RunStatus.completed)
+                        storage.add_event(run_id, "done", "Run completed successfully after repair-only cycle.")
+                        return
+                    if attempt == run.max_attempts:
+                        storage.update_status(run_id, RunStatus.failed)
+                        storage.add_event(run_id, "failed", "Max attempts reached in repair-only mode.")
+                        return
+                    continue
+
                 storage.add_event(run_id, "planning", "Requesting implementation plan from DeepSeek.")
                 code_plan = await self.deepseek.build_code_plan(run.task_text, context_md)
                 storage.add_event(run_id, "planning", "Implementation plan received.")
@@ -96,7 +137,9 @@ class AgentOrchestrator:
                     task_text=run.task_text,
                     context_md=context_md,
                     use_repo_context=run.use_repo_context,
+                    invariants_md=invariants_md,
                 )
+                self._run_consistency_checks(project_root=project_root, run_id=run_id)
                 storage.add_event(run_id, "verify", "Running local verification commands.")
                 self._run_local_commands(project_root, code_plan.local_commands, run_id)
                 storage.add_event(run_id, "git", "Running local git flow.")
@@ -115,6 +158,7 @@ class AgentOrchestrator:
                     return
             except Exception as exc:
                 error_msg = str(exc)
+                last_error_msg = error_msg
                 storage.add_event(run_id, "error", "Pipeline step failed.", {"error": error_msg})
                 storage.add_event(
                     run_id,
@@ -126,12 +170,17 @@ class AgentOrchestrator:
                     run_id=run_id,
                     run=run,
                     error_msg=error_msg,
-                    context_md=context_md,
+                    context_md=(
+                        f"{context_md}\n\n## Last attempt fix directive (must follow)\n{last_fix_hint}".strip()
+                        if last_fix_hint
+                        else context_md
+                    ),
                     project_root=project_root,
                 )
                 if llm_repair_applied:
-                    storage.add_event(run_id, "repair", "LLM repair succeeded. Continuing with next validation cycle.")
-                    continue
+                    storage.update_status(run_id, RunStatus.completed)
+                    storage.add_event(run_id, "done", "Run completed successfully after LLM repair.")
+                    return
                 if attempt == run.max_attempts:
                     storage.update_status(run_id, RunStatus.failed)
                     storage.add_event(run_id, "failed", "Max attempts reached.")
@@ -140,6 +189,12 @@ class AgentOrchestrator:
                 storage.add_event(run_id, "review", "Requesting fix hint for next attempt.")
                 fix_hint = await self.deepseek.review_and_fix_hint(run.task_text, error_msg, context_md)
                 storage.add_event(run_id, "review", "Generated fix hint for next attempt.", {"hint": fix_hint})
+                last_fix_hint = fix_hint.strip()
+                if last_fix_hint:
+                    context_md = (
+                        f"{context_md}\n\n## Last attempt fix directive (must follow)\n{last_fix_hint}"
+                    ).strip()
+                repair_only_mode = True
 
         storage.update_status(run_id, RunStatus.failed)
         storage.add_event(run_id, "failed", "Pipeline exited unexpectedly.")
@@ -217,6 +272,7 @@ class AgentOrchestrator:
         task_text: str,
         context_md: str,
         use_repo_context: bool,
+        invariants_md: str,
     ) -> None:
         storage.add_event(run_id, "plan", "Implementation plan generated.", {"summary": code_plan.summary})
         generated_snapshots: list[tuple[str, str]] = []
@@ -231,12 +287,15 @@ class AgentOrchestrator:
                 base_content = target.read_text(encoding="utf-8")[: settings.repo_context_max_chars_per_file]
 
             generated_files_md = self._format_generated_snapshots(generated_snapshots)
+            dependency_context_md = self._build_dependency_context(project_root=root, target_rel_path=item.path)
             final_content = await self.deepseek.generate_file_content(
                 task_text=task_text,
                 context_md=context_md,
                 file_path=item.path,
                 generated_files_md=generated_files_md,
                 base_file_content=base_content or item.content,
+                dependency_context_md=dependency_context_md,
+                invariants_md=invariants_md,
             )
             target.write_text(final_content, encoding="utf-8")
             generated_snapshots.append((item.path, final_content[: settings.repo_context_max_chars_per_file]))
@@ -246,6 +305,108 @@ class AgentOrchestrator:
                 "File generated/updated (iterative).",
                 {"path": str(target), "with_repo_context": use_repo_context},
             )
+
+    def _build_invariants_context(self) -> str:
+        parsed = urlparse(settings.healthcheck_url)
+        health_port = parsed.port or settings.app_port
+        health_path = parsed.path or "/health"
+        return (
+            f"- Deploy directory: {settings.deploy_project_dir}\n"
+            f"- Public app port must be: {settings.app_port}\n"
+            f"- Healthcheck URL must be reachable: {settings.healthcheck_url}\n"
+            f"- Healthcheck port inferred: {health_port}\n"
+            f"- Healthcheck path inferred: {health_path}\n"
+            "- Docker compose service naming must be consistent with runtime env references.\n"
+            "- DATABASE_URL host should match compose postgres service name.\n"
+            "- Database name in DATABASE_URL should match provisioned DB (POSTGRES_DB or created db)."
+        )
+
+    def _build_dependency_context(self, project_root: Path, target_rel_path: str) -> str:
+        target = (project_root / target_rel_path).resolve()
+        if not target.exists() or project_root not in target.parents:
+            return ""
+
+        selected: dict[str, str] = {}
+
+        def add_file(path: Path) -> None:
+            try:
+                if project_root not in path.parents and path != project_root:
+                    return
+                if not path.exists() or not path.is_file():
+                    return
+                rel = path.relative_to(project_root).as_posix()
+                if rel in selected:
+                    return
+                selected[rel] = path.read_text(encoding="utf-8")[: settings.repo_context_max_chars_per_file]
+            except Exception:
+                return
+
+        add_file(target)
+        # Always include high-impact infra files if present.
+        for infra_name in ("docker-compose.yml", ".env", "README.md"):
+            add_file(project_root / infra_name)
+
+        content = target.read_text(encoding="utf-8")
+        imports = re.findall(r"^\s*(?:from\s+([a-zA-Z0-9_\.]+)\s+import|import\s+([a-zA-Z0-9_\.]+))", content, flags=re.M)
+        import_tokens = {token for pair in imports for token in pair if token}
+
+        for token in sorted(import_tokens):
+            base = token.replace(".", "/")
+            candidates = [
+                project_root / f"{base}.py",
+                project_root / base / "__init__.py",
+            ]
+            for candidate in candidates:
+                add_file(candidate)
+
+        # Include neighbors in same folder to keep local cohesion.
+        for sibling in sorted(target.parent.glob("*"))[:8]:
+            if sibling.is_file() and sibling.suffix in {".py", ".js", ".ts", ".html", ".css", ".yml", ".yaml", ".json"}:
+                add_file(sibling)
+
+        chunks = [f"### {rel}\n{body}" for rel, body in list(selected.items())[: settings.repo_context_max_files]]
+        return "\n\n".join(chunks)[:30000]
+
+    def _run_consistency_checks(self, project_root: Path, run_id: str) -> None:
+        compose_file = project_root / "docker-compose.yml"
+        if not compose_file.exists():
+            storage.add_event(run_id, "consistency", "docker-compose.yml not found. Consistency checks skipped.")
+            return
+
+        compose_text = compose_file.read_text(encoding="utf-8")
+        issues: list[str] = []
+
+        # Check 1: healthcheck port should be exposed in compose.
+        parsed = urlparse(settings.healthcheck_url)
+        health_port = parsed.port or settings.app_port
+        if f"\"{health_port}:" not in compose_text and f"{health_port}:" not in compose_text:
+            issues.append(f"Healthcheck port {health_port} is not exposed in docker-compose ports.")
+
+        # Check 2: DATABASE_URL host should map to existing service.
+        db_url_match = re.search(r"DATABASE_URL:\s*([^\n]+)", compose_text)
+        if db_url_match:
+            db_url = db_url_match.group(1).strip().strip("'\"")
+            host = ""
+            db_name = ""
+            pg_match = re.search(r"postgres(?:ql)?://[^@]+@([^/:]+)(?::\d+)?/([a-zA-Z0-9_\-]+)", db_url)
+            if pg_match:
+                host = pg_match.group(1)
+                db_name = pg_match.group(2)
+            if host and not re.search(rf"^\s*{re.escape(host)}\s*:", compose_text, flags=re.M):
+                issues.append(f"DATABASE_URL host '{host}' has no matching service in docker-compose.")
+            postgres_db_match = re.search(r"POSTGRES_DB:\s*([^\n]+)", compose_text)
+            if db_name and postgres_db_match:
+                postgres_db = postgres_db_match.group(1).strip().strip("'\"")
+                if postgres_db and postgres_db != db_name:
+                    issues.append(
+                        f"DATABASE_URL db '{db_name}' differs from POSTGRES_DB '{postgres_db}'."
+                    )
+
+        if issues:
+            storage.add_event(run_id, "consistency", "Consistency checks failed.", {"issues": issues})
+            raise RuntimeError("Consistency checks failed: " + "; ".join(issues))
+
+        storage.add_event(run_id, "consistency", "Consistency checks passed.", {"checks": 3})
 
     def _format_generated_snapshots(self, snapshots: list[tuple[str, str]]) -> str:
         if not snapshots:

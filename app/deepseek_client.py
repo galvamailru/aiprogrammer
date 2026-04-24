@@ -132,6 +132,8 @@ class DeepSeekClient:
         file_path: str,
         generated_files_md: str,
         base_file_content: str,
+        dependency_context_md: str = "",
+        invariants_md: str = "",
     ) -> str:
         if not self._api_key:
             if base_file_content:
@@ -147,10 +149,12 @@ class DeepSeekClient:
         user_prompt = (
             f"Business task:\n{task_text}\n\n"
             f"Context docs:\n{context_md}\n\n"
+            f"Hard invariants (must not be violated):\n{invariants_md}\n\n"
             f"Target file path:\n{file_path}\n\n"
             f"Current file content from repository (if exists):\n{base_file_content}\n\n"
+            f"Dependency-aware retrieved context:\n{dependency_context_md}\n\n"
             f"Already generated key files:\n{generated_files_md}\n\n"
-            "Generate final content for the target file."
+            "Generate final content for the target file. Keep consistency with dependencies and invariants."
         )
         raw = await self._chat(system_prompt, user_prompt)
         try:
