@@ -75,6 +75,34 @@ class DeepSeekClient:
                     return None
         return None
 
+    def _validate_repair_plan_payload(self, parsed: dict[str, Any]) -> tuple[bool, str]:
+        actions = parsed.get("actions")
+        if not isinstance(actions, list) or not actions:
+            return False, "actions must be a non-empty array"
+
+        allowed = {
+            "run_remote_command",
+            "run_local_command",
+            "replace_text_in_file",
+            "update_healthcheck_url",
+            "ensure_postgres_db",
+        }
+        for idx, action in enumerate(actions):
+            if not isinstance(action, dict):
+                return False, f"actions[{idx}] must be an object"
+            action_type = str(action.get("action_type", "")).strip().lower()
+            if action_type not in allowed:
+                return False, f"actions[{idx}].action_type is invalid"
+            if action_type in {"run_remote_command", "run_local_command"} and not str(action.get("command", "")).strip():
+                return False, f"actions[{idx}].command is required for {action_type}"
+            if action_type == "replace_text_in_file":
+                if not str(action.get("file_path", "")).strip():
+                    return False, f"actions[{idx}].file_path is required for replace_text_in_file"
+                if not str(action.get("find_text", "")).strip():
+                    return False, f"actions[{idx}].find_text is required for replace_text_in_file"
+
+        return True, ""
+
     async def build_code_plan(self, task_text: str, context_md: str) -> CodePlan:
         if not self._api_key:
             return self._fallback_code_plan(task_text)
@@ -208,34 +236,46 @@ class DeepSeekClient:
 
         system_prompt = (
             "You are an autonomous SRE+backend repair agent. "
-            "Return strict JSON with keys: diagnosis, confidence, actions, expected_outcome, validation_steps. "
-            "actions is array of objects with keys: action_type, target, command, file_path, find_text, replace_text, reason. "
+            "Return strict JSON only (no markdown). "
+            "Required top-level keys: diagnosis(string), confidence(number 0..1), actions(array), expected_outcome(string), validation_steps(array of strings). "
+            "Each action must include: action_type, target, command, file_path, find_text, replace_text, reason. "
             "Allowed action_type values: run_remote_command, run_local_command, replace_text_in_file, update_healthcheck_url, ensure_postgres_db. "
-            "Prefer minimal reversible changes."
+            "For run_remote_command/run_local_command, command MUST be non-empty and executable as-is. "
+            "For replace_text_in_file, provide file_path and exact find_text+replace_text. "
+            "Do not return empty actions unless no safe action exists."
         )
         user_prompt = (
             f"Business task:\n{task_text}\n\n"
             f"Error:\n{last_error}\n\n"
             f"Runtime facts:\n{runtime_facts}\n\n"
             f"Context docs:\n{context_md}\n\n"
-            "Generate a repair plan."
+            "Generate a concrete repair plan with executable commands."
         )
-        raw = await self._chat(system_prompt, user_prompt)
-        parsed = self._parse_json_relaxed(raw)
-        if parsed is None:
-            retry_prompt = (
-                user_prompt
-                + "\n\nReturn ONLY valid JSON object. Do not use markdown, prose, or code fences."
-            )
-            raw_retry = await self._chat(system_prompt, retry_prompt)
-            parsed = self._parse_json_relaxed(raw_retry)
-        if parsed is not None:
+        validation_feedback = ""
+        for _ in range(3):
+            prompt = user_prompt
+            if validation_feedback:
+                prompt += (
+                    "\n\nPrevious response was rejected. Fix it and return JSON again.\n"
+                    f"Validation error: {validation_feedback}\n"
+                    "Return ONLY JSON object."
+                )
+            raw = await self._chat(system_prompt, prompt)
+            parsed = self._parse_json_relaxed(raw)
+            if parsed is None:
+                validation_feedback = "invalid JSON format"
+                continue
+            valid, reason = self._validate_repair_plan_payload(parsed)
+            if not valid:
+                validation_feedback = reason
+                continue
             try:
                 return RepairPlan(**parsed)
-            except Exception:
-                pass
+            except Exception as exc:
+                validation_feedback = f"schema validation failed: {exc}"
+                continue
         return RepairPlan(
-            diagnosis="Failed to parse repair plan JSON.",
+            diagnosis=f"Failed to build valid repair plan JSON. {validation_feedback or 'Unknown parsing issue.'}",
             confidence=0.1,
             actions=[],
             expected_outcome="No executable repair actions.",
