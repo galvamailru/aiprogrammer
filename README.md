@@ -84,7 +84,7 @@ docker logs -f aiprogrammer
 - `app/orchestrator.py` - state machine and retry loop
 - `app/deepseek_client.py` - model calls
 - `app/terminal_runner.py` - local + SSH command execution
-- `app/deployment.py` - deploy and health flow
+- `app/deployment.py` - deploy, logs, and compose runtime checks
 - `app/storage.py` - run metadata and context docs
 
 ## Notes
@@ -95,7 +95,6 @@ docker logs -f aiprogrammer
   - `run_remote_command`
   - `run_local_command`
   - `replace_text_in_file`
-  - `update_healthcheck_url`
   - `ensure_postgres_db`
 - For production, add:
   - secrets manager integration

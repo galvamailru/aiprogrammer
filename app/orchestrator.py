@@ -6,7 +6,6 @@ import re
 import tempfile
 import time
 from pathlib import Path
-from urllib.parse import urlparse
 
 from .config import settings
 from .deepseek_client import DeepSeekClient
@@ -41,6 +40,7 @@ class AgentOrchestrator:
             architecture_spec=architecture_spec,
             architect_prompt=architect_prompt,
             use_repo_context=use_repo_context,
+            pipeline_mode="full",
         )
         storage.add_event(run.run_id, "intake", "Task accepted and queued.")
         if architecture_spec.strip():
@@ -49,6 +49,47 @@ class AgentOrchestrator:
                 "architecture",
                 "Architecture TZ approved and attached to run context.",
                 {"chars": len(architecture_spec)},
+            )
+        storage.update_status(run.run_id, RunStatus.running)
+        task = asyncio.create_task(self._run_pipeline(run.run_id))
+        task.add_done_callback(lambda t, rid=run.run_id: self._on_pipeline_done(rid, t))
+        return run
+
+    def start_fix_run(
+        self,
+        change_request: str,
+        git_url: str | None = None,
+        deploy_project_dir: str | None = None,
+        contract_architecture_spec: str | None = None,
+        use_repo_context: bool = True,
+    ) -> AgentRun:
+        cr = (change_request or "").strip()
+        if not cr:
+            raise ValueError("change_request cannot be empty.")
+        effective_git_url = (git_url or "").strip()
+        effective_deploy_dir = (deploy_project_dir or settings.deploy_project_dir).strip()
+        arch = (contract_architecture_spec or "").strip()
+        run = storage.create_run(
+            task_text=cr,
+            max_attempts=settings.max_fix_attempts,
+            git_url=effective_git_url,
+            deploy_project_dir=effective_deploy_dir,
+            architecture_spec=arch,
+            architect_prompt="",
+            use_repo_context=use_repo_context,
+            pipeline_mode="fix_only",
+        )
+        storage.add_event(
+            run.run_id,
+            "intake",
+            "Fix-only run accepted (minimal-diff pipeline; architect draft skipped).",
+        )
+        if arch:
+            storage.add_event(
+                run.run_id,
+                "architecture",
+                "Contract / architecture markdown attached for fix-only context.",
+                {"chars": len(arch)},
             )
         storage.update_status(run.run_id, RunStatus.running)
         task = asyncio.create_task(self._run_pipeline(run.run_id))
@@ -85,10 +126,22 @@ class AgentOrchestrator:
         run = storage.get_run(run_id)
         docs = storage.list_documents()
         context_md = "\n\n".join([f"## {doc.name}\n{doc.content}" for doc in docs])[:50000]
-        if run.architecture_spec.strip():
+        if run.pipeline_mode == "fix_only":
             context_md = (
-                f"{context_md}\n\n## Approved architecture specification\n{run.architecture_spec.strip()}"
+                "## Fix-only pipeline (orchestrator constraints)\n"
+                "- Apply the smallest change set that satisfies the change request.\n"
+                "- Preserve public HTTP routes, JSON payloads, env var names, and compose service identifiers "
+                "unless the change request explicitly requires changing them.\n"
+                "- Do not refactor unrelated modules or rename symbols outside the request scope.\n\n"
+                f"{context_md}"
             ).strip()
+        if run.architecture_spec.strip():
+            label = (
+                "## Contract / approved architecture specification (preserve unless request overrides)\n"
+                if run.pipeline_mode == "fix_only"
+                else "## Approved architecture specification\n"
+            )
+            context_md = f"{context_md}\n\n{label}{run.architecture_spec.strip()}".strip()
         project_root = settings.local_project_path
         project_root.mkdir(parents=True, exist_ok=True)
         storage.add_event(run_id, "pipeline", "Pipeline started.", {"project_root": str(project_root)})
@@ -153,8 +206,17 @@ class AgentOrchestrator:
                         return
                     continue
 
-                storage.add_event(run_id, "planning", "Requesting implementation plan from DeepSeek.")
-                code_plan = await self.deepseek.build_code_plan(run.task_text, context_md)
+                if run.pipeline_mode == "fix_only":
+                    storage.add_event(run_id, "planning", "Requesting minimal-change plan (fix-only).")
+                    code_plan = await self.deepseek.build_fix_code_plan(run.task_text, context_md)
+                    if not code_plan.files:
+                        raise RuntimeError(
+                            "Fix-only plan produced no file changes. Refine the change_request, "
+                            "enable repo context with a valid git_url, or check DeepSeek API access."
+                        )
+                else:
+                    storage.add_event(run_id, "planning", "Requesting implementation plan from DeepSeek.")
+                    code_plan = await self.deepseek.build_code_plan(run.task_text, context_md)
                 storage.add_event(run_id, "planning", "Implementation plan received.")
                 storage.add_event(run_id, "codegen", "Applying generated file changes.")
                 await self._materialize_files_iterative(
@@ -165,6 +227,7 @@ class AgentOrchestrator:
                     context_md=context_md,
                     use_repo_context=run.use_repo_context,
                     invariants_md=invariants_md,
+                    fix_only=run.pipeline_mode == "fix_only",
                 )
                 self._run_consistency_checks(project_root=project_root, run_id=run_id)
                 storage.add_event(run_id, "verify", "Running local verification commands.")
@@ -309,10 +372,14 @@ class AgentOrchestrator:
         context_md: str,
         use_repo_context: bool,
         invariants_md: str,
+        fix_only: bool = False,
     ) -> None:
         storage.add_event(run_id, "plan", "Implementation plan generated.", {"summary": code_plan.summary})
         generated_snapshots: list[tuple[str, str]] = []
-        files = code_plan.files[: settings.iterative_codegen_max_files]
+        file_cap = settings.iterative_codegen_max_files
+        if fix_only:
+            file_cap = min(file_cap, settings.fix_only_max_plan_files)
+        files = code_plan.files[:file_cap]
         for item in files:
             target = (root / item.path).resolve()
             if root not in target.parents and target != root:
@@ -332,6 +399,7 @@ class AgentOrchestrator:
                 base_file_content=base_content or item.content,
                 dependency_context_md=dependency_context_md,
                 invariants_md=invariants_md,
+                fix_only=fix_only,
             )
             target.write_text(final_content, encoding="utf-8")
             generated_snapshots.append((item.path, final_content[: settings.repo_context_max_chars_per_file]))
@@ -343,15 +411,11 @@ class AgentOrchestrator:
             )
 
     def _build_invariants_context(self) -> str:
-        parsed = urlparse(settings.healthcheck_url)
-        health_port = parsed.port or settings.app_port
-        health_path = parsed.path or "/health"
         return (
             f"- Deploy directory: {settings.deploy_project_dir}\n"
-            f"- Public app port must be: {settings.app_port}\n"
-            f"- Healthcheck URL must be reachable: {settings.healthcheck_url}\n"
-            f"- Healthcheck port inferred: {health_port}\n"
-            f"- Healthcheck path inferred: {health_path}\n"
+            f"- Default public app port hint (only if the architecture uses it): {settings.app_port}\n"
+            "- Final deploy proof is not a fixed /health URL: the approved architecture markdown must include "
+            "\"## Deploy verification (final stage)\" with concrete shell checks; the orchestrator runs those on the server after compose.\n"
             "- Docker compose service naming must be consistent with runtime env references.\n"
             "- DATABASE_URL host should match compose postgres service name.\n"
             "- Database name in DATABASE_URL should match provisioned DB (POSTGRES_DB or created db)."
@@ -412,19 +476,13 @@ class AgentOrchestrator:
         compose_text = compose_file.read_text(encoding="utf-8")
         issues: list[str] = []
 
-        # Check 1: healthcheck port should be exposed in compose.
-        parsed = urlparse(settings.healthcheck_url)
-        health_port = parsed.port or settings.app_port
-        if f"\"{health_port}:" not in compose_text and f"{health_port}:" not in compose_text:
-            issues.append(f"Healthcheck port {health_port} is not exposed in docker-compose ports.")
-
-        # Check 2: detect duplicate host-port mappings (bind conflict risk).
+        # Check 1: detect duplicate host-port mappings (bind conflict risk).
         host_ports = re.findall(r"['\"]?(\d+)\s*:\s*\d+['\"]?", compose_text)
         duplicates = sorted({port for port in host_ports if host_ports.count(port) > 1})
         for dup in duplicates:
             issues.append(f"Host port {dup} is mapped more than once in docker-compose services.")
 
-        # Check 3: DATABASE_URL host should map to existing service.
+        # Check 2: DATABASE_URL host should map to existing service.
         db_url_match = re.search(r"DATABASE_URL:\s*([^\n]+)", compose_text)
         if db_url_match:
             db_url = db_url_match.group(1).strip().strip("'\"")
@@ -459,7 +517,7 @@ class AgentOrchestrator:
             storage.add_event(run_id, "consistency", "Consistency checks failed.", {"issues": issues})
             raise RuntimeError("Consistency checks failed: " + "; ".join(issues))
 
-        storage.add_event(run_id, "consistency", "Consistency checks passed.", {"checks": 4})
+        storage.add_event(run_id, "consistency", "Consistency checks passed.", {"checks": 2})
 
     def _format_generated_snapshots(self, snapshots: list[tuple[str, str]]) -> str:
         if not snapshots:
@@ -667,29 +725,77 @@ class AgentOrchestrator:
                 storage.add_event(run_id, event_stage, "Deployment logs captured.", payload=logs.model_dump())
                 raise RuntimeError(item.stderr_tail or item.stdout_tail or "Remote deploy failed.")
 
-    def _validate_deployed_stack(self, run_id: str, deploy_project_dir: str) -> None:
+    def _wrap_deploy_verify_command(self, snippet: str, deploy_project_dir: str) -> str:
+        cmd = (snippet or "").strip()
+        if not cmd:
+            return ""
+        lowered = cmd.lstrip().lower()
+        if lowered.startswith("cd "):
+            return cmd
+        safe_dir = deploy_project_dir.replace('"', "")
+        return f"cd \"{safe_dir}\" && {cmd}"
+
+    async def _validate_deployed_stack(self, run_id: str, deploy_project_dir: str, run: AgentRun) -> None:
         runtime_checks = self.deployment.validate_remote_runtime(deploy_project_dir=deploy_project_dir)
         for check in runtime_checks:
             storage.add_event(run_id, "runtime", "Runtime validation step executed.", payload=check.model_dump())
             if not check.ok:
                 raise RuntimeError(check.stderr_tail or check.stdout_tail or "Runtime validation failed.")
 
-        health = self.deployment.healthcheck_remote(deploy_project_dir=deploy_project_dir)
-        storage.add_event(run_id, "health", "Healthcheck completed.", payload=health.model_dump())
-        if not health.ok:
-            fallback = self.deployment.healthcheck_remote_backend_fallback(deploy_project_dir=deploy_project_dir)
-            storage.add_event(run_id, "health", "Healthcheck fallback executed.", payload=fallback.model_dump())
-            if fallback.ok:
-                return
-            logs = self.deployment.fetch_remote_logs(deploy_project_dir=deploy_project_dir)
-            storage.add_event(run_id, "health", "Healthcheck failed, logs captured.", payload=logs.model_dump())
-            raise RuntimeError(health.stderr_tail or "Healthcheck failed.")
+        plan = await self.deepseek.propose_deploy_verification_commands(
+            task_text=run.task_text,
+            architecture_spec=run.architecture_spec or "",
+            deploy_project_dir=deploy_project_dir,
+        )
+        storage.add_event(
+            run_id,
+            "deploy_verify",
+            "Architecture-driven deploy verification plan received.",
+            {
+                "rationale": plan.rationale,
+                "command_count": len(plan.commands),
+                "commands": plan.commands,
+            },
+        )
+        if not plan.commands:
+            storage.add_event(
+                run_id,
+                "deploy_verify",
+                "No remote verification commands (empty plan or no API key); compose ps + logs gate only.",
+            )
+            return
+
+        timeout_sec = max(30, settings.deploy_verify_ssh_timeout_sec)
+        total = len(plan.commands)
+        for idx, snippet in enumerate(plan.commands, start=1):
+            final_cmd = self._wrap_deploy_verify_command(snippet, deploy_project_dir)
+            if not final_cmd:
+                continue
+            result = self.runner.run_ssh(final_cmd, timeout_sec=timeout_sec)
+            storage.add_event(
+                run_id,
+                "deploy_verify",
+                f"Deploy verification command {idx}/{total} executed.",
+                payload=result.model_dump(),
+            )
+            if not result.ok:
+                logs = self.deployment.fetch_remote_logs(deploy_project_dir=deploy_project_dir)
+                storage.add_event(
+                    run_id,
+                    "deploy_verify",
+                    "Deploy verification failed; compose logs captured.",
+                    payload=logs.model_dump(),
+                )
+                raise RuntimeError(
+                    result.stderr_tail or result.stdout_tail or f"Deploy verification step {idx} failed."
+                )
 
     async def _deploy_and_validate(self, run_id: str, git_url: str, deploy_project_dir: str) -> bool:
         if not git_url:
             raise RuntimeError("Deploy requires git_url from UI.")
+        run = storage.get_run(run_id)
         self._deploy_remote_stack(run_id, git_url, deploy_project_dir, "deploy")
-        self._validate_deployed_stack(run_id, deploy_project_dir)
+        await self._validate_deployed_stack(run_id, deploy_project_dir, run)
         return True
 
     async def _try_llm_repair(
@@ -734,7 +840,7 @@ class AgentOrchestrator:
         remote_actions: list = []
         for action in plan.actions:
             action_type = (action.action_type or "").strip().lower()
-            if action_type in {"replace_text_in_file", "update_healthcheck_url"}:
+            if action_type == "replace_text_in_file":
                 file_actions.append(action)
             elif action_type in {"run_remote_command", "run_local_command", "ensure_postgres_db"}:
                 remote_actions.append(action)
@@ -770,14 +876,6 @@ class AgentOrchestrator:
                 if not ok:
                     return False
                 had_successful_replace = True
-                continue
-            if action_type == "update_healthcheck_url":
-                storage.add_event(
-                    run_id,
-                    "repair",
-                    "Healthcheck URL update requested; using remote fallback validation in current run.",
-                    {"requested_target": action.target, "action_type": action_type},
-                )
                 continue
 
         if had_successful_replace:
@@ -889,7 +987,7 @@ class AgentOrchestrator:
         if settings.auto_deploy:
             try:
                 if had_successful_replace:
-                    self._validate_deployed_stack(run_id, run.deploy_project_dir)
+                    await self._validate_deployed_stack(run_id, run.deploy_project_dir, run)
                 else:
                     await self._deploy_and_validate(run_id, run.git_url, run.deploy_project_dir)
             except RuntimeError as exc:
@@ -1043,8 +1141,6 @@ class AgentOrchestrator:
                     continue
                 return True
             if action_type == "ensure_postgres_db":
-                return True
-            if action_type == "update_healthcheck_url":
                 return True
             if action_type in {"run_remote_command", "run_local_command"}:
                 cmd = (action.command or "").strip().lower()

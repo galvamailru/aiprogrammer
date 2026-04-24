@@ -43,6 +43,7 @@ class InMemoryStorage:
         architecture_spec: str = "",
         architect_prompt: str = "",
         use_repo_context: bool = True,
+        pipeline_mode: str = "full",
     ) -> AgentRun:
         run_id = uuid.uuid4().hex
         run = AgentRun(
@@ -54,6 +55,7 @@ class InMemoryStorage:
             architecture_spec=architecture_spec,
             architect_prompt=architect_prompt,
             use_repo_context=use_repo_context,
+            pipeline_mode=pipeline_mode,
         )
         with self._lock:
             self._runs[run_id] = run

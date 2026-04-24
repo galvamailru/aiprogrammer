@@ -9,7 +9,13 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from .config import settings
-from .models import ArchitectApproveRequest, ArchitectDraftRequest, BusinessTaskRequest, GitAuthTestRequest
+from .models import (
+    ArchitectApproveRequest,
+    ArchitectDraftRequest,
+    BusinessTaskRequest,
+    FixOnlyRunRequest,
+    GitAuthTestRequest,
+)
 from .orchestrator import orchestrator
 from .storage import storage
 
@@ -74,6 +80,24 @@ async def create_run(payload: BusinessTaskRequest) -> dict:
         use_repo_context=payload.use_repo_context,
     )
     return {"ok": True, "run_id": run.run_id}
+
+
+@app.post("/api/runs/fix-only")
+async def create_fix_only_run(payload: FixOnlyRunRequest) -> dict:
+    change_request = payload.change_request.strip()
+    if not change_request:
+        raise HTTPException(status_code=400, detail="change_request cannot be empty.")
+    try:
+        run = orchestrator.start_fix_run(
+            change_request=change_request,
+            git_url=payload.git_url,
+            deploy_project_dir=payload.deploy_project_dir,
+            contract_architecture_spec=payload.contract_architecture_spec,
+            use_repo_context=payload.use_repo_context,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "run_id": run.run_id, "pipeline_mode": run.pipeline_mode}
 
 
 @app.post("/api/architect/draft")

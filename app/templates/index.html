@@ -45,6 +45,18 @@
     </section>
 
     <section class="card">
+      <h2>2b. Fix-only run (no architect draft)</h2>
+      <p class="subtitle">Minimal-diff pipeline: same Git / deploy fields as above; optional contract TZ to preserve API shape.</p>
+      <form id="fix-only-form">
+        <label for="fix-change-request">Change request</label>
+        <textarea id="fix-change-request" rows="6" placeholder="e.g. Frontend calls /api/items but backend exposes /api/v1/items — align paths and types only." required></textarea>
+        <label for="fix-contract-spec">Contract / TZ (optional, same role as approved architecture)</label>
+        <textarea id="fix-contract-spec" rows="6" placeholder="Paste prior architecture markdown or OpenAPI excerpt…"></textarea>
+        <button type="submit">Start fix-only pipeline</button>
+      </form>
+    </section>
+
+    <section class="card">
       <h2>3. Runs</h2>
       <div id="runs"></div>
     </section>
@@ -156,6 +168,7 @@
           <p><b>Git:</b> ${run.git_url || "-"}</p>
           <p><b>Deploy dir:</b> ${run.deploy_project_dir || "-"}</p>
           <p><b>Repo context:</b> ${run.use_repo_context ? "ON" : "OFF"}</p>
+          <p><b>Pipeline:</b> ${run.pipeline_mode || "full"}</p>
           <p>${run.task_text}</p>
         `;
         card.onclick = async () => {
@@ -247,6 +260,33 @@
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: payload
+      });
+      selectedRunId = result.run_id;
+      await loadRuns();
+    });
+
+    document.getElementById("fix-only-form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const changeRequest = document.getElementById("fix-change-request").value.trim();
+      const gitUrl = document.getElementById("git-url").value.trim();
+      const deployDir = document.getElementById("deploy-dir").value.trim();
+      const useRepoContext = document.getElementById("use-repo-context").checked;
+      const contract = document.getElementById("fix-contract-spec").value.trim();
+      if (!changeRequest || !gitUrl || !deployDir) {
+        alert("Change request, Git URL and deploy dir are required (reuse fields from section 2).");
+        return;
+      }
+      const body = {
+        change_request: changeRequest,
+        git_url: gitUrl,
+        deploy_project_dir: deployDir,
+        use_repo_context: useRepoContext
+      };
+      if (contract) body.contract_architecture_spec = contract;
+      const result = await api("/api/runs/fix-only", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
       });
       selectedRunId = result.run_id;
       await loadRuns();

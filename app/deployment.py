@@ -1,10 +1,5 @@
 from __future__ import annotations
 
-import re
-import time
-
-import httpx
-
 from .config import settings
 from .models import CommandResult
 from .terminal_runner import TerminalRunner
@@ -57,7 +52,7 @@ class DeploymentService:
             {
                 "id": "connection_refused_health",
                 "signatures": ["[errno 111] connection refused", "connection refused"],
-                "action": "check backend exposed port and use remote healthcheck fallback",
+                "action": "inspect compose ports and application listen address per architecture spec",
             },
         ]
 
@@ -150,86 +145,3 @@ class DeploymentService:
             )
 
         return checks
-
-    def healthcheck(self) -> CommandResult:
-        # Keep local HTTP fallback for compatibility, but primary check should be remote.
-        deadline = time.time() + settings.healthcheck_timeout_seconds
-        last_error = ""
-        while time.time() < deadline:
-            try:
-                response = httpx.get(settings.healthcheck_url, timeout=10)
-                if 200 <= response.status_code < 300:
-                    return CommandResult(
-                        ok=True,
-                        command=f"GET {settings.healthcheck_url}",
-                        exit_code=0,
-                        stdout_tail=response.text[-4000:],
-                        stderr_tail="",
-                        duration_sec=0.0,
-                        source="http",
-                    )
-                last_error = f"HTTP {response.status_code}: {response.text[:400]}"
-            except Exception as exc:
-                last_error = str(exc)
-            time.sleep(5)
-        return CommandResult(
-            ok=False,
-            command=f"GET {settings.healthcheck_url}",
-            exit_code=1,
-            stdout_tail="",
-            stderr_tail=last_error,
-            duration_sec=float(settings.healthcheck_timeout_seconds),
-            source="http",
-        )
-
-    def healthcheck_remote(self, deploy_project_dir: str) -> CommandResult:
-        safe_dir = deploy_project_dir.replace('"', "")
-        deadline = time.time() + settings.healthcheck_timeout_seconds
-        while time.time() < deadline:
-            result = self.runner.run_ssh(
-                (
-                    f"cd \"{safe_dir}\" && "
-                    f"curl -fsS --max-time 10 \"{settings.healthcheck_url}\""
-                ),
-                timeout_sec=30,
-            )
-            if result.ok:
-                result.command = f"REMOTE GET {settings.healthcheck_url}"
-                return result
-            time.sleep(5)
-        return CommandResult(
-            ok=False,
-            command=f"REMOTE GET {settings.healthcheck_url}",
-            exit_code=1,
-            stdout_tail="",
-            stderr_tail="Remote healthcheck timed out or failed.",
-            duration_sec=float(settings.healthcheck_timeout_seconds),
-            source="ssh-http",
-        )
-
-    def healthcheck_remote_backend_fallback(self, deploy_project_dir: str) -> CommandResult:
-        safe_dir = deploy_project_dir.replace('"', "")
-        ps = self.runner.run_ssh(f"cd \"{safe_dir}\" && docker compose ps", timeout_sec=120)
-        if not ps.ok:
-            return ps
-
-        content = f"{ps.stdout_tail}\n{ps.stderr_tail}"
-        port_match = re.search(r"0\.0\.0\.0:(\d+)->8000/tcp", content)
-        if not port_match:
-            return CommandResult(
-                ok=False,
-                command="remote backend fallback healthcheck",
-                exit_code=1,
-                stdout_tail=content[-4000:],
-                stderr_tail="Unable to detect mapped backend port from docker compose ps.",
-                duration_sec=0.0,
-                source="analyzer",
-            )
-
-        mapped_port = port_match.group(1)
-        check = self.runner.run_ssh(
-            f"curl -fsS --max-time 10 \"http://127.0.0.1:{mapped_port}/health\"",
-            timeout_sec=30,
-        )
-        check.command = f"REMOTE GET http://127.0.0.1:{mapped_port}/health"
-        return check

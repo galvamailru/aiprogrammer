@@ -58,6 +58,19 @@ class ArchitectApproveRequest(BaseModel):
     use_repo_context: bool = True
 
 
+class FixOnlyRunRequest(BaseModel):
+    """Short pipeline: minimal code changes against existing repo, no architect draft step."""
+
+    change_request: str
+    git_url: str | None = None
+    deploy_project_dir: str | None = None
+    contract_architecture_spec: str | None = Field(
+        default=None,
+        description="Optional approved TZ / API contract to preserve; merged into model context.",
+    )
+    use_repo_context: bool = True
+
+
 class GitAuthTestRequest(BaseModel):
     git_url: str
 
@@ -91,6 +104,13 @@ class RepairPlan(BaseModel):
     validation_steps: List[str] = Field(default_factory=list)
 
 
+class DeployVerificationPlan(BaseModel):
+    """LLM-derived remote shell steps after compose, from architecture + task."""
+
+    commands: List[str] = Field(default_factory=list)
+    rationale: str = ""
+
+
 class AgentRun(BaseModel):
     run_id: str
     created_at: datetime = Field(default_factory=datetime.utcnow)
@@ -104,4 +124,6 @@ class AgentRun(BaseModel):
     architecture_spec: str = ""
     architect_prompt: str = ""
     use_repo_context: bool = True
+    """full: normal codegen; fix_only: minimal-diff plan and stricter file edits."""
+    pipeline_mode: str = "full"
     events: List[RunEvent] = Field(default_factory=list)

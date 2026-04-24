@@ -8,7 +8,7 @@ from typing import Any
 import httpx
 
 from .config import settings
-from .models import CodeFileProposal, CodePlan, RepairPlan
+from .models import CodeFileProposal, CodePlan, DeployVerificationPlan, RepairPlan
 
 
 class DeepSeekClient:
@@ -84,7 +84,6 @@ class DeepSeekClient:
             "run_remote_command",
             "run_local_command",
             "replace_text_in_file",
-            "update_healthcheck_url",
             "ensure_postgres_db",
         }
         for idx, action in enumerate(actions):
@@ -134,6 +133,34 @@ class DeepSeekClient:
         except Exception:
             return self._fallback_code_plan(task_text)
 
+    async def build_fix_code_plan(self, change_request: str, context_md: str) -> CodePlan:
+        if not self._api_key:
+            return CodePlan(
+                summary="No DeepSeek API key; cannot build fix-only plan.",
+                files=[],
+                local_commands=[],
+            )
+        cap = settings.fix_only_max_plan_files
+        system_prompt = settings.fix_only_plan_system_prompt
+        user_prompt = (
+            f"Change request (implement with minimal scope):\n{change_request}\n\n"
+            f"Hard cap: at most {cap} objects in the files array.\n\n"
+            f"Repository / contract context:\n{context_md[:55000]}\n\n"
+            "Return JSON: summary, files (each with path and full content), local_commands."
+        )
+        raw = await self._chat(system_prompt, user_prompt)
+        try:
+            parsed: dict[str, Any] = json.loads(raw)
+            plan = CodePlan(**parsed)
+        except Exception:
+            return CodePlan(
+                summary="Failed to parse fix-only plan JSON.",
+                files=[],
+                local_commands=[],
+            )
+        plan.files = plan.files[:cap]
+        return plan
+
     async def generate_file_content(
         self,
         task_text: str,
@@ -143,18 +170,29 @@ class DeepSeekClient:
         base_file_content: str,
         dependency_context_md: str = "",
         invariants_md: str = "",
+        fix_only: bool = False,
     ) -> str:
         if not self._api_key:
             if base_file_content:
                 return base_file_content
             return f"# Fallback content for {file_path}\n"
 
-        system_prompt = (
-            "You are a senior Python full-stack engineer. "
-            "Return strict JSON with key: content. "
-            "Generate code for a single file with path provided by user. "
-            "Respect already generated files and keep API/import consistency."
-        )
+        if fix_only:
+            system_prompt = (
+                "You are applying a minimal patch to one file in an existing project. "
+                "Return strict JSON with key: content. "
+                "content must be the COMPLETE file after your edit. "
+                "Touch only what the change request requires; keep imports, structure, formatting, and unrelated logic unchanged. "
+                "Do not rename routes, env vars, or service identifiers unless the change request explicitly requires it. "
+                "Preserve public API contracts (paths, JSON shapes) described in context unless the request mandates a breaking change."
+            )
+        else:
+            system_prompt = (
+                "You are a senior Python full-stack engineer. "
+                "Return strict JSON with key: content. "
+                "Generate code for a single file with path provided by user. "
+                "Respect already generated files and keep API/import consistency."
+            )
         user_prompt = (
             f"Business task:\n{task_text}\n\n"
             f"Context docs:\n{context_md}\n\n"
@@ -163,7 +201,11 @@ class DeepSeekClient:
             f"Current file content from repository (if exists):\n{base_file_content}\n\n"
             f"Dependency-aware retrieved context:\n{dependency_context_md}\n\n"
             f"Already generated key files:\n{generated_files_md}\n\n"
-            "Generate final content for the target file. Keep consistency with dependencies and invariants."
+            + (
+                "Apply the change request with minimal diff. Output the full file."
+                if fix_only
+                else "Generate final content for the target file. Keep consistency with dependencies and invariants."
+            )
         )
         raw = await self._chat(system_prompt, user_prompt)
         try:
@@ -214,8 +256,53 @@ class DeepSeekClient:
             "## Non-functional requirements\n- Stability and maintainability.\n\n"
             "## Project structure requirements\n- Clear project layout and dependencies.\n\n"
             "## Run requirements\n- Provide container startup flow.\n\n"
-            "## Acceptance criteria\n- Health endpoint returns success."
+                "## Acceptance criteria\n- Main behavior works end-to-end.\n\n"
+                "## Deploy verification (final stage)\n"
+                "1. Preconditions: describe ports and URLs on 127.0.0.1 after compose.\n"
+                "2. Run `docker compose ps` and expect all required services running.\n"
+                "3. One smoke check appropriate to the app (e.g. curl a documented endpoint).\n"
+                "4. Failure criteria: non-2xx HTTP or error signatures in logs.\n"
         )
+
+    async def propose_deploy_verification_commands(
+        self,
+        task_text: str,
+        architecture_spec: str,
+        deploy_project_dir: str,
+    ) -> DeployVerificationPlan:
+        if not self._api_key:
+            return DeployVerificationPlan(commands=[], rationale="No API key; skipping model-generated deploy verification.")
+
+        system_prompt = (
+            "You translate an approved architecture specification into executable remote verification. "
+            "Return strict JSON only with keys: commands (array of strings), rationale (string). "
+            f"commands must have at most {settings.deploy_verify_max_commands} entries. "
+            "Each command is a single-line shell snippet run on the Linux deployment host over SSH. "
+            "Prefer commands that assume the current directory will be prefixed with "
+            f"`cd \\\"{deploy_project_dir}\\\" &&` by the orchestrator when the snippet does not already start with `cd `. "
+            "Use docker compose, curl, wget, psql, etc. as appropriate to the stack described in the architecture. "
+            "Do not use destructive operations (no rm -rf, no volume wipes, no mkfs). "
+            "If the architecture's 'Deploy verification (final stage)' section is missing or too vague, infer minimal safe checks from Run requirements and Acceptance criteria."
+        )
+        user_prompt = (
+            f"Business task:\n{task_text}\n\n"
+            f"Deploy directory on server (project root):\n{deploy_project_dir}\n\n"
+            f"Approved architecture specification (markdown):\n{architecture_spec[:60000]}\n\n"
+            "Produce commands that prove the deployment works after docker compose up."
+        )
+        raw = await self._chat(system_prompt, user_prompt)
+        parsed = self._parse_json_relaxed(raw)
+        if not isinstance(parsed, dict):
+            return DeployVerificationPlan(commands=[], rationale="Model returned invalid JSON for deploy verification.")
+        cmds_raw = parsed.get("commands")
+        if not isinstance(cmds_raw, list):
+            return DeployVerificationPlan(commands=[], rationale="commands array missing or invalid.")
+        out: list[str] = []
+        for item in cmds_raw[: settings.deploy_verify_max_commands]:
+            if isinstance(item, str) and item.strip():
+                out.append(item.strip())
+        rationale = str(parsed.get("rationale", "")).strip()
+        return DeployVerificationPlan(commands=out, rationale=rationale)
 
     async def review_and_fix_hint(self, task_text: str, last_error: str, context_md: str) -> str:
         if not self._api_key:
@@ -254,7 +341,7 @@ class DeepSeekClient:
             "Return strict JSON only (no markdown). "
             "Required top-level keys: diagnosis(string), confidence(number 0..1), actions(array), expected_outcome(string), validation_steps(array of strings). "
             "Each action must include: action_type, target, command, file_path, find_text, replace_text, reason. "
-            "Allowed action_type values: run_remote_command, run_local_command, replace_text_in_file, update_healthcheck_url, ensure_postgres_db. "
+            "Allowed action_type values: run_remote_command, run_local_command, replace_text_in_file, ensure_postgres_db. "
             "Use run_remote_command for diagnostics and runtime/deployment actions. "
             "Do NOT use run_local_command in repair plans. "
             "When editing files, file_path must be relative to repository root (e.g., docker-compose.yml), not absolute remote paths. "
