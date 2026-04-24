@@ -27,6 +27,7 @@ class AgentOrchestrator:
         deploy_project_dir: str | None = None,
         architecture_spec: str = "",
         architect_prompt: str = "",
+        use_repo_context: bool = True,
     ) -> AgentRun:
         effective_git_url = (git_url or "").strip()
         effective_deploy_dir = (deploy_project_dir or settings.deploy_project_dir).strip()
@@ -37,6 +38,7 @@ class AgentOrchestrator:
             deploy_project_dir=effective_deploy_dir,
             architecture_spec=architecture_spec,
             architect_prompt=architect_prompt,
+            use_repo_context=use_repo_context,
         )
         storage.add_event(run.run_id, "intake", "Task accepted and queued.")
         if architecture_spec.strip():
@@ -62,6 +64,22 @@ class AgentOrchestrator:
         project_root.mkdir(parents=True, exist_ok=True)
         storage.add_event(run_id, "pipeline", "Pipeline started.", {"project_root": str(project_root)})
         self._prepare_local_repo(project_root=project_root, git_url=run.git_url, run_id=run_id)
+        repo_context_md = self._build_repo_context(project_root, run.use_repo_context)
+        if repo_context_md:
+            storage.add_event(
+                run_id,
+                "context",
+                "Repository context extracted for model.",
+                {"chars": len(repo_context_md), "enabled": run.use_repo_context},
+            )
+            context_md = f"{context_md}\n\n## Pulled repository context\n{repo_context_md}".strip()
+        else:
+            storage.add_event(
+                run_id,
+                "context",
+                "Repository context disabled or unavailable; generation starts from task/context docs.",
+                {"enabled": run.use_repo_context},
+            )
 
         for attempt in range(1, run.max_attempts + 1):
             storage.set_attempt(run_id, attempt)
@@ -71,7 +89,14 @@ class AgentOrchestrator:
                 code_plan = await self.deepseek.build_code_plan(run.task_text, context_md)
                 storage.add_event(run_id, "planning", "Implementation plan received.")
                 storage.add_event(run_id, "codegen", "Applying generated file changes.")
-                self._materialize_files(project_root, code_plan, run_id)
+                await self._materialize_files_iterative(
+                    root=project_root,
+                    code_plan=code_plan,
+                    run_id=run_id,
+                    task_text=run.task_text,
+                    context_md=context_md,
+                    use_repo_context=run.use_repo_context,
+                )
                 storage.add_event(run_id, "verify", "Running local verification commands.")
                 self._run_local_commands(project_root, code_plan.local_commands, run_id)
                 storage.add_event(run_id, "git", "Running local git flow.")
@@ -185,6 +210,78 @@ class AgentOrchestrator:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(item.content, encoding="utf-8")
             storage.add_event(run_id, "codegen", "File generated/updated.", {"path": str(target)})
+
+    async def _materialize_files_iterative(
+        self,
+        root: Path,
+        code_plan: CodePlan,
+        run_id: str,
+        task_text: str,
+        context_md: str,
+        use_repo_context: bool,
+    ) -> None:
+        storage.add_event(run_id, "plan", "Implementation plan generated.", {"summary": code_plan.summary})
+        generated_snapshots: list[tuple[str, str]] = []
+        files = code_plan.files[: settings.iterative_codegen_max_files]
+        for item in files:
+            target = (root / item.path).resolve()
+            if root not in target.parents and target != root:
+                raise ValueError(f"Refused to write outside project root: {item.path}")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            base_content = ""
+            if use_repo_context and target.exists():
+                base_content = target.read_text(encoding="utf-8")[: settings.repo_context_max_chars_per_file]
+
+            generated_files_md = self._format_generated_snapshots(generated_snapshots)
+            final_content = await self.deepseek.generate_file_content(
+                task_text=task_text,
+                context_md=context_md,
+                file_path=item.path,
+                generated_files_md=generated_files_md,
+                base_file_content=base_content or item.content,
+            )
+            target.write_text(final_content, encoding="utf-8")
+            generated_snapshots.append((item.path, final_content[: settings.repo_context_max_chars_per_file]))
+            storage.add_event(
+                run_id,
+                "codegen",
+                "File generated/updated (iterative).",
+                {"path": str(target), "with_repo_context": use_repo_context},
+            )
+
+    def _format_generated_snapshots(self, snapshots: list[tuple[str, str]]) -> str:
+        if not snapshots:
+            return ""
+        chunks = []
+        for path, content in snapshots[-6:]:
+            chunks.append(f"### {path}\n{content}")
+        return "\n\n".join(chunks)[:20000]
+
+    def _build_repo_context(self, project_root: Path, enabled: bool) -> str:
+        if not enabled:
+            return ""
+        candidates: list[Path] = []
+        patterns = ("*.py", "*.md", "*.txt", "*.yml", "*.yaml", "*.json", "*.html", "*.js", "*.css")
+        for pattern in patterns:
+            candidates.extend(project_root.rglob(pattern))
+        unique = []
+        seen = set()
+        for file_path in sorted(candidates):
+            if ".git" in file_path.parts:
+                continue
+            if file_path in seen:
+                continue
+            seen.add(file_path)
+            unique.append(file_path)
+        snippets: list[str] = []
+        for file_path in unique[: settings.repo_context_max_files]:
+            try:
+                content = file_path.read_text(encoding="utf-8")[: settings.repo_context_max_chars_per_file]
+            except Exception:
+                continue
+            rel = file_path.relative_to(project_root).as_posix()
+            snippets.append(f"### {rel}\n{content}")
+        return "\n\n".join(snippets)
 
     def _run_local_commands(self, root: Path, commands: list[str], run_id: str) -> None:
         if not commands:

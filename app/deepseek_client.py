@@ -6,7 +6,7 @@ from typing import Any
 import httpx
 
 from .config import settings
-from .models import CodePlan, CodeFileProposal, RepairPlan
+from .models import CodeFileProposal, CodePlan, RepairPlan
 
 
 class DeepSeekClient:
@@ -68,6 +68,43 @@ class DeepSeekClient:
             return CodePlan(**parsed)
         except Exception:
             return self._fallback_code_plan(task_text)
+
+    async def generate_file_content(
+        self,
+        task_text: str,
+        context_md: str,
+        file_path: str,
+        generated_files_md: str,
+        base_file_content: str,
+    ) -> str:
+        if not self._api_key:
+            if base_file_content:
+                return base_file_content
+            return f"# Fallback content for {file_path}\n"
+
+        system_prompt = (
+            "You are a senior Python full-stack engineer. "
+            "Return strict JSON with key: content. "
+            "Generate code for a single file with path provided by user. "
+            "Respect already generated files and keep API/import consistency."
+        )
+        user_prompt = (
+            f"Business task:\n{task_text}\n\n"
+            f"Context docs:\n{context_md}\n\n"
+            f"Target file path:\n{file_path}\n\n"
+            f"Current file content from repository (if exists):\n{base_file_content}\n\n"
+            f"Already generated key files:\n{generated_files_md}\n\n"
+            "Generate final content for the target file."
+        )
+        raw = await self._chat(system_prompt, user_prompt)
+        try:
+            parsed: dict[str, Any] = json.loads(raw)
+            content = str(parsed.get("content", "")).strip()
+            if content:
+                return content + ("\n" if not content.endswith("\n") else "")
+        except Exception:
+            pass
+        return base_file_content or f"# Empty content generated for {file_path}\n"
 
     async def build_architecture_spec(self, task_text: str, context_md: str, architect_prompt: str | None = None) -> str:
         if not self._api_key:

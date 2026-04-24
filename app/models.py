@@ -41,6 +41,7 @@ class BusinessTaskRequest(BaseModel):
     task_text: str
     git_url: str | None = None
     deploy_project_dir: str | None = None
+    use_repo_context: bool = True
 
 
 class ArchitectDraftRequest(BaseModel):
@@ -54,6 +55,7 @@ class ArchitectApproveRequest(BaseModel):
     deploy_project_dir: str | None = None
     architecture_spec: str
     architect_prompt: str | None = None
+    use_repo_context: bool = True
 
 
 class GitAuthTestRequest(BaseModel):
@@ -101,4 +103,5 @@ class AgentRun(BaseModel):
     deploy_project_dir: str = ""
     architecture_spec: str = ""
     architect_prompt: str = ""
+    use_repo_context: bool = True
     events: List[RunEvent] = Field(default_factory=list)

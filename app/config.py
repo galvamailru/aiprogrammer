@@ -40,6 +40,9 @@ class Settings(BaseSettings):
 
     upload_dir: str = "./uploads"
     run_data_dir: str = "./runs"
+    repo_context_max_files: int = 12
+    repo_context_max_chars_per_file: int = 5000
+    iterative_codegen_max_files: int = 30
 
     @property
     def local_project_path(self) -> Path:

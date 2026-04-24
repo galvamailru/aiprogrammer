@@ -71,6 +71,7 @@ async def create_run(payload: BusinessTaskRequest) -> dict:
         task_text=task_text,
         git_url=payload.git_url,
         deploy_project_dir=payload.deploy_project_dir,
+        use_repo_context=payload.use_repo_context,
     )
     return {"ok": True, "run_id": run.run_id}
 
@@ -98,6 +99,7 @@ async def approve_and_start(payload: ArchitectApproveRequest) -> dict:
         deploy_project_dir=payload.deploy_project_dir,
         architecture_spec=architecture_spec,
         architect_prompt=(payload.architect_prompt or "").strip(),
+        use_repo_context=payload.use_repo_context,
     )
     return {"ok": True, "run_id": run.run_id}
 

@@ -31,6 +31,10 @@
         <div id="git-auth-result"></div>
         <label for="deploy-dir">Deploy directory on Linux server</label>
         <input type="text" id="deploy-dir" placeholder="/opt/myapp" required>
+        <label for="use-repo-context">
+          <input type="checkbox" id="use-repo-context" checked>
+          Use pulled Git code as model context (review/change existing project)
+        </label>
         <label for="task-text">Business task</label>
         <textarea id="task-text" rows="8" placeholder="Describe business task and expected outcome..." required></textarea>
         <button type="button" id="generate-arch-spec">Generate TZ</button>
@@ -97,6 +101,7 @@
           <p><b>Attempt:</b> ${run.current_attempt}/${run.max_attempts}</p>
           <p><b>Git:</b> ${run.git_url || "-"}</p>
           <p><b>Deploy dir:</b> ${run.deploy_project_dir || "-"}</p>
+          <p><b>Repo context:</b> ${run.use_repo_context ? "ON" : "OFF"}</p>
           <p>${run.task_text}</p>
         `;
         card.onclick = async () => {
@@ -125,6 +130,7 @@
       }).join("");
       panel.innerHTML = `
         <h3>Run details: ${run.run_id}</h3>
+        <p><b>Repo context mode:</b> ${run.use_repo_context ? "ON (review/change pulled code)" : "OFF (generate from scratch context)"}</p>
         <ul class="events">${events || "<li>No events yet</li>"}</ul>
       `;
       document.querySelector(".container").appendChild(panel);
@@ -166,6 +172,7 @@
       const deployDir = document.getElementById("deploy-dir").value.trim();
       const architectPrompt = document.getElementById("architect-prompt").value.trim();
       const architectureSpec = document.getElementById("architecture-spec").value.trim();
+      const useRepoContext = document.getElementById("use-repo-context").checked;
       if (!taskText || !gitUrl || !deployDir || !architectureSpec) {
         alert("Task, git URL, deploy dir and approved TZ are required.");
         return;
@@ -175,7 +182,8 @@
         git_url: gitUrl,
         deploy_project_dir: deployDir,
         architecture_spec: architectureSpec,
-        architect_prompt: architectPrompt || null
+        architect_prompt: architectPrompt || null,
+        use_repo_context: useRepoContext
       });
       const result = await api("/api/architect/approve-start", {
         method: "POST",
