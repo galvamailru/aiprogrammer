@@ -37,18 +37,25 @@ class AgentOrchestrator:
         context_md = "\n\n".join([f"## {doc.name}\n{doc.content}" for doc in docs])[:50000]
         project_root = settings.local_project_path
         project_root.mkdir(parents=True, exist_ok=True)
+        storage.add_event(run_id, "pipeline", "Pipeline started.", {"project_root": str(project_root)})
         self._prepare_local_repo(project_root=project_root, git_url=run.git_url, run_id=run_id)
 
         for attempt in range(1, run.max_attempts + 1):
             storage.set_attempt(run_id, attempt)
             storage.add_event(run_id, "attempt", f"Attempt {attempt}/{run.max_attempts} started.")
             try:
+                storage.add_event(run_id, "planning", "Requesting implementation plan from DeepSeek.")
                 code_plan = await self.deepseek.build_code_plan(run.task_text, context_md)
+                storage.add_event(run_id, "planning", "Implementation plan received.")
+                storage.add_event(run_id, "codegen", "Applying generated file changes.")
                 self._materialize_files(project_root, code_plan, run_id)
+                storage.add_event(run_id, "verify", "Running local verification commands.")
                 self._run_local_commands(project_root, code_plan.local_commands, run_id)
+                storage.add_event(run_id, "git", "Running local git flow.")
                 self._run_git_flow(project_root, run_id, attempt)
 
                 if settings.auto_deploy:
+                    storage.add_event(run_id, "deploy", "Starting remote deploy sequence.")
                     deployed = await self._deploy_and_validate(run_id, run.git_url, run.deploy_project_dir)
                     if deployed:
                         storage.update_status(run_id, RunStatus.completed)
@@ -66,6 +73,7 @@ class AgentOrchestrator:
                     storage.add_event(run_id, "failed", "Max attempts reached.")
                     return
 
+                storage.add_event(run_id, "review", "Requesting fix hint for next attempt.")
                 fix_hint = await self.deepseek.review_and_fix_hint(run.task_text, error_msg, context_md)
                 storage.add_event(run_id, "review", "Generated fix hint for next attempt.", {"hint": fix_hint})
 
