@@ -282,7 +282,10 @@ class DeepSeekClient:
             f"`cd \\\"{deploy_project_dir}\\\" &&` by the orchestrator when the snippet does not already start with `cd `. "
             "Use docker compose, curl, wget, psql, etc. as appropriate to the stack described in the architecture. "
             "Do not use destructive operations (no rm -rf, no volume wipes, no mkfs). "
-            "If the architecture's 'Deploy verification (final stage)' section is missing or too vague, infer minimal safe checks from Run requirements and Acceptance criteria."
+            "If the architecture's 'Deploy verification (final stage)' section is missing or too vague, infer minimal safe checks from Run requirements and Acceptance criteria. "
+            "Discover real service names and published ports from the stack: early commands should establish ground truth "
+            "(e.g. `docker compose ps`, `docker compose config --services`) before curls to specific URLs. "
+            "Do not invent service names or host ports; derive them from compose/architecture or from the output of those discovery commands within the same command list."
         )
         user_prompt = (
             f"Business task:\n{task_text}\n\n"
@@ -318,6 +321,54 @@ class DeepSeekClient:
         except Exception:
             return "Failed to parse review response. Check logs and deployment steps."
 
+    async def propose_repair_discovery_commands(
+        self,
+        task_text: str,
+        last_error: str,
+        runtime_facts: str,
+    ) -> list[str]:
+        """Model-chosen read-only SSH steps before a repair plan (generic, not error-specific)."""
+        if not self._api_key:
+            return []
+        system_prompt = (
+            "You are a senior SRE debugging a failed deploy or validation step. "
+            "Return strict JSON only: { \"commands\": string[], \"rationale\": string }. "
+            "commands has at most 5 entries; each is one line run on the deployment host over SSH (read-only). "
+            "Purpose: gather facts that remove guesswork before anyone edits files. "
+            "Allowed patterns: docker compose ps, docker compose logs, docker compose config, "
+            "docker compose exec SERVICE cat PATH, curl -sS -D- (no body dump of huge binaries), nginx -t, ls, test -f. "
+            "Forbidden: modifying files, git write, docker compose down, rm, volume wipes, redirects that overwrite files, kubectl delete. "
+            "If runtime_facts (compose ps, logs) already pin the root cause, return commands: [] and explain in rationale. "
+            "When using docker compose from a project checkout, prefix with cd to that directory if the path appears in facts."
+        )
+        user_prompt = (
+            f"Business task:\n{task_text}\n\n"
+            f"Primary error:\n{last_error}\n\n"
+            f"Known runtime facts:\n{runtime_facts[:48000]}\n\n"
+            "Propose a short diagnostic sequence (or empty if unnecessary). When one hypothesis is weak, add checks from another angle "
+            "(reverse proxy vs app routes vs DB vs bind mounts vs wrong published port)."
+        )
+        raw = await self._chat(system_prompt, user_prompt)
+        parsed = self._parse_json_relaxed(raw)
+        if not isinstance(parsed, dict):
+            return []
+        cmds_raw = parsed.get("commands")
+        if not isinstance(cmds_raw, list):
+            return []
+        out: list[str] = []
+        forbidden = ("rm -rf", " mkfs", " dd ", "docker compose down", "git push", "git commit", "> /etc/", "> /dev/")
+        for item in cmds_raw[:5]:
+            if not isinstance(item, str):
+                continue
+            cmd = item.strip()
+            if not cmd:
+                continue
+            lowered = cmd.lower()
+            if any(bad in lowered for bad in forbidden):
+                continue
+            out.append(cmd)
+        return out
+
     async def propose_repair_plan(
         self,
         task_text: str,
@@ -335,30 +386,29 @@ class DeepSeekClient:
             )
 
         system_prompt = (
-            "You are the sole repair agent: you take full responsibility for fixing the project so the pipeline succeeds. "
-            "No other layer will silently patch files for you. "
-            "Work in two phases: diagnose from the Error line and Runtime facts, then apply treatment. "
+            "You are the sole repair agent: you decide what is broken and how to fix it; no other layer invents patches for you. "
             "Return strict JSON only (no markdown). "
             "Required top-level keys: diagnosis(string), confidence(number 0..1), actions(array), expected_outcome(string), validation_steps(array of strings). "
             "Each action must include: action_type, target, command, file_path, find_text, replace_text, reason. "
             "Allowed action_type values: run_remote_command, run_local_command, replace_text_in_file, ensure_postgres_db. "
-            "Use run_remote_command for diagnostics and runtime/deployment actions. "
             "Do NOT use run_local_command in repair plans. "
-            "When editing files, file_path must be relative to repository root (e.g., docker-compose.yml), not absolute remote paths. "
-            "replace_text_in_file: find_text MUST be copied verbatim from the repository excerpt in runtime facts (same quotes, spaces, newlines). "
-            "Never invent port mappings (e.g. guessing 8085:8085); only use text that actually appears in the excerpt. "
+            "Investigation mindset: form hypotheses from the Error and Runtime facts. If evidence is thin or prior fixes failed (see recent_repair_feedback), "
+            "do NOT guess find_text for replace_text_in_file—use run_remote_command to disprove/confirm hypotheses (different angles: HTTP path vs reverse proxy vs "
+            "app route vs DB vs bind mount vs wrong service). "
+            "When MODEL_DIAGNOSTIC_CAPTURE appears in runtime facts, treat it as authoritative ground truth from the host; reconcile it with repository excerpts. "
+            "replace_text_in_file: file_path relative to repo root; find_text MUST be copied verbatim from a repository file excerpt in runtime facts OR from "
+            "MODEL_DIAGNOSTIC_CAPTURE only when that capture clearly shows the same file content that exists in the repo (e.g. mounted config). "
+            "Never paste imagined nginx/docker-compose snippets. "
             "Docker Compose rule: each host port (left side of host:container in ports:) must appear at most once in the file. "
-            "If the error says a host port is mapped more than once, you MUST edit docker-compose (or compose.yml) so only one service publishes that host port "
-            "(e.g. remove the duplicate ports: entry from nginx/frontend or change its published host port). "
+            "If the error says a host port is mapped more than once, edit compose so only one service publishes that host port. "
             "Use 'docker compose' syntax (not docker-compose) when suggesting shell commands. "
-            "Execution order (orchestrator): every replace_text_in_file runs first; then git commit/push and server git pull + docker compose up (when auto_deploy); then run_remote_command actions in plan order; then validation_steps. "
-            "So remote shell commands always see the repository after your file edits—do not assume the server is stale relative to find_text. "
-            "The section recent_repair_feedback lists failures from the current incident only (since the last successful repair). "
-            "Do not repeat the same failed find_text or shell command unless you state what changed in the repo or on the host. "
-            "If diagnosis is uncertain, first actions may be diagnostic run_remote_command steps that gather decisive facts. "
-            "For run_remote_command/run_local_command, command MUST be non-empty and executable as-is. "
+            "Execution order (orchestrator): all replace_text_in_file run first; then git commit/push and server pull + compose rebuild (when auto_deploy); "
+            "then run_remote_command / ensure_postgres_db in list order; then validation_steps. "
+            "So remote commands after file edits see updated files on the server—schedule run_remote_command accordingly (e.g. rebuild after config change). "
+            "recent_repair_feedback: failures in the current incident. If the same patch class failed repeatedly, switch strategy and cite new evidence. "
+            "For run_remote_command, command MUST be non-empty and executable as-is. "
             "For replace_text_in_file, replace_text is the replacement substring (use empty string only when intentionally removing find_text). "
-            "Include explicit validation_steps as executable commands (quoted). "
+            "validation_steps: concrete shell snippets (quoted) to prove the fix. "
             "Do not return empty actions unless no safe action exists."
         )
         user_prompt = (

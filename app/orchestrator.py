@@ -786,9 +786,13 @@ class AgentOrchestrator:
                     "Deploy verification failed; compose logs captured.",
                     payload=logs.model_dump(),
                 )
-                raise RuntimeError(
-                    result.stderr_tail or result.stdout_tail or f"Deploy verification step {idx} failed."
-                )
+                msg = (
+                    f"Deploy verification step {idx}/{total} failed (exit {result.exit_code}).\n"
+                    f"Command: {final_cmd}\n"
+                    f"--- stdout ---\n{(result.stdout_tail or '').strip()}\n"
+                    f"--- stderr ---\n{(result.stderr_tail or '').strip()}"
+                ).strip()
+                raise RuntimeError(msg or f"Deploy verification step {idx} failed.")
 
     async def _deploy_and_validate(self, run_id: str, git_url: str, deploy_project_dir: str) -> bool:
         if not git_url:
@@ -818,6 +822,39 @@ class AgentOrchestrator:
             )
         merged_parts.append(f"[recent_repair_feedback]\n{recent_feedback}")
         merged_runtime_facts = "\n\n".join(merged_parts).strip()
+
+        discovery_cmds = await self.deepseek.propose_repair_discovery_commands(
+            task_text=run.task_text,
+            last_error=error_msg,
+            runtime_facts=merged_runtime_facts,
+        )
+        if discovery_cmds:
+            storage.add_event(
+                run_id,
+                "repair",
+                "Discovery phase: model proposed diagnostic SSH commands before repair plan.",
+                {"commands": discovery_cmds},
+            )
+            diag_chunks: list[str] = []
+            for i, cmd in enumerate(discovery_cmds, start=1):
+                cmd_stripped = cmd.strip()
+                if not cmd_stripped:
+                    continue
+                dresult = self.runner.run_ssh(cmd_stripped, timeout_sec=300)
+                storage.add_event(
+                    run_id,
+                    "repair",
+                    f"Discovery command {i}/{len(discovery_cmds)} executed.",
+                    payload=dresult.model_dump(),
+                )
+                diag_chunks.append(
+                    f"### discovery_{i}\nCOMMAND: {cmd_stripped}\nEXIT: {dresult.exit_code}\n"
+                    f"--- stdout ---\n{dresult.stdout_tail}\n--- stderr ---\n{dresult.stderr_tail}"
+                )
+            if diag_chunks:
+                bundle = "\n".join(diag_chunks)[:40000]
+                merged_runtime_facts = f"{merged_runtime_facts}\n\n[MODEL_DIAGNOSTIC_CAPTURE]\n{bundle}"
+
         plan: RepairPlan = await self.deepseek.propose_repair_plan(
             task_text=run.task_text,
             last_error=error_msg,
