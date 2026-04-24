@@ -105,6 +105,10 @@ class DeepSeekClient:
                     return False, f"actions[{idx}].file_path is required for replace_text_in_file"
                 if not str(action.get("find_text", "")).strip():
                     return False, f"actions[{idx}].find_text is required for replace_text_in_file"
+                if "replace_text" not in action or action.get("replace_text") is None:
+                    return False, f"actions[{idx}].replace_text is required for replace_text_in_file (string, use \"\" to delete find_text)"
+                if str(action.get("find_text", "")).strip() == str(action.get("replace_text", "")).strip():
+                    return False, f"actions[{idx}].find_text and replace_text must differ for replace_text_in_file"
 
         return True, ""
 
@@ -244,8 +248,9 @@ class DeepSeekClient:
             )
 
         system_prompt = (
-            "You are an autonomous SRE+backend repair agent. "
-            "Work in two phases: diagnose based on runtime facts, then propose treatment actions. "
+            "You are the sole repair agent: you take full responsibility for fixing the project so the pipeline succeeds. "
+            "No other layer will silently patch files for you. "
+            "Work in two phases: diagnose from the Error line and Runtime facts, then apply treatment. "
             "Return strict JSON only (no markdown). "
             "Required top-level keys: diagnosis(string), confidence(number 0..1), actions(array), expected_outcome(string), validation_steps(array of strings). "
             "Each action must include: action_type, target, command, file_path, find_text, replace_text, reason. "
@@ -253,20 +258,26 @@ class DeepSeekClient:
             "Use run_remote_command for diagnostics and runtime/deployment actions. "
             "Do NOT use run_local_command in repair plans. "
             "When editing files, file_path must be relative to repository root (e.g., docker-compose.yml), not absolute remote paths. "
-            "Use 'docker compose' syntax (not docker-compose) and avoid hardcoded container names when compose commands are possible. "
-            "Do not repeat commands that already failed in recent_repair_feedback unless you explain why the preconditions changed. "
-            "If diagnosis is uncertain, first actions should be diagnostic run_remote_command actions that gather decisive facts. "
+            "replace_text_in_file: find_text MUST be copied verbatim from the repository excerpt in runtime facts (same quotes, spaces, newlines). "
+            "Never invent port mappings (e.g. guessing 8085:8085); only use text that actually appears in the excerpt. "
+            "Docker Compose rule: each host port (left side of host:container in ports:) must appear at most once in the file. "
+            "If the error says a host port is mapped more than once, you MUST edit docker-compose (or compose.yml) so only one service publishes that host port "
+            "(e.g. remove the duplicate ports: entry from nginx/frontend or change its published host port). "
+            "Use 'docker compose' syntax (not docker-compose) when suggesting shell commands. "
+            "The section recent_repair_feedback lists failures from the current incident only (since the last successful repair). "
+            "Do not repeat the same failed find_text or shell command unless you state what changed in the repo or on the host. "
+            "If diagnosis is uncertain, first actions may be diagnostic run_remote_command steps that gather decisive facts. "
             "For run_remote_command/run_local_command, command MUST be non-empty and executable as-is. "
-            "For replace_text_in_file, provide file_path and exact find_text+replace_text. "
+            "For replace_text_in_file, replace_text is the replacement substring (use empty string only when intentionally removing find_text). "
             "Include explicit validation_steps as executable commands (quoted). "
             "Do not return empty actions unless no safe action exists."
         )
         user_prompt = (
             f"Business task:\n{task_text}\n\n"
-            f"Error:\n{last_error}\n\n"
-            f"Runtime facts:\n{runtime_facts}\n\n"
+            f"Error (primary signal):\n{last_error}\n\n"
+            f"Runtime facts (includes compose excerpt and recent_repair_feedback when present):\n{runtime_facts}\n\n"
             f"Context docs:\n{context_md}\n\n"
-            "Generate a concrete repair plan with executable commands."
+            "Produce a repair plan whose actions you can defend: file edits must match the excerpt exactly; remote commands must be safe and minimal."
         )
         validation_feedback = ""
         for _ in range(3):

@@ -695,9 +695,18 @@ class AgentOrchestrator:
         context_md: str,
         project_root: Path,
     ) -> bool:
+        duplicate_port = self._extract_duplicate_port_issue(error_msg)
         runtime_facts = self._collect_runtime_facts(deploy_project_dir=run.deploy_project_dir)
         recent_feedback = self._collect_recent_repair_feedback(run_id=run_id)
-        merged_runtime_facts = f"{runtime_facts}\n\n[recent_repair_feedback]\n{recent_feedback}".strip()
+        compose_snippet = self._compose_file_fact_snippet(project_root)
+        merged_parts = [runtime_facts]
+        if compose_snippet:
+            merged_parts.append(
+                "[docker_compose — current repository excerpt; find_text MUST match this text exactly]\n"
+                + compose_snippet
+            )
+        merged_parts.append(f"[recent_repair_feedback]\n{recent_feedback}")
+        merged_runtime_facts = "\n\n".join(merged_parts).strip()
         plan: RepairPlan = await self.deepseek.propose_repair_plan(
             task_text=run.task_text,
             last_error=error_msg,
@@ -713,16 +722,6 @@ class AgentOrchestrator:
                 "repair",
                 "Repair plan rejected: no treatment action (diagnostics-only plan).",
                 {"actions": [a.model_dump() for a in plan.actions]},
-            )
-            return False
-
-        duplicate_port = self._extract_duplicate_port_issue(error_msg)
-        if duplicate_port and not self._has_compose_fix_action(plan.actions):
-            storage.add_event(
-                run_id,
-                "repair",
-                "Repair plan rejected: duplicate port conflict requires compose fix action.",
-                {"required_port": duplicate_port},
             )
             return False
 
@@ -830,17 +829,32 @@ class AgentOrchestrator:
             self._run_git_flow(project_root, run_id, attempt=run.current_attempt or 1)
 
         if settings.auto_deploy:
-            return await self._deploy_and_validate(run_id, run.git_url, run.deploy_project_dir)
+            if not await self._deploy_and_validate(run_id, run.git_url, run.deploy_project_dir):
+                return False
+        storage.add_event(run_id, "repair", "Repair feedback window cleared.", {})
         return True
 
     def _collect_recent_repair_feedback(self, run_id: str) -> str:
         run_snapshot = storage.get_run(run_id)
+        events = run_snapshot.events
+        baseline_idx = -1
+        for i, ev in enumerate(events):
+            if ev.stage == "repair" and ev.message == "Repair feedback window cleared.":
+                baseline_idx = i
+        window_events = events[baseline_idx + 1 :] if baseline_idx >= 0 else events
+
         failed_commands: list[str] = []
         rejected_actions: list[str] = []
-        for ev in reversed(run_snapshot.events):
+        for ev in reversed(window_events):
             if ev.stage != "repair":
                 continue
             payload = ev.payload or {}
+            if ev.message == "Repair file patch applied." and payload.get("ok") is False:
+                fp = str(payload.get("normalized_file_path", "")).strip()
+                failed_commands.append(
+                    "replace_text_in_file: find_text did not match file (check exact whitespace/quotes)"
+                    + (f" | file={fp}" if fp else "")
+                )
             if ev.message == "Repair action executed." and payload.get("ok") is False:
                 cmd = str(payload.get("command", "")).strip()
                 err = str(payload.get("stderr_tail", "")).strip()
@@ -848,13 +862,15 @@ class AgentOrchestrator:
                     failed_commands.append(f"command={cmd} | stderr={err}")
             if ev.message.startswith("Repair action rejected"):
                 rejected_actions.append(str(payload))
-            if len(failed_commands) >= 6 and len(rejected_actions) >= 4:
+            if ev.message.startswith("Repair plan rejected"):
+                rejected_actions.append(f"{ev.message} | {payload}")
+            if len(failed_commands) >= 6 and len(rejected_actions) >= 6:
                 break
         chunks = []
         if failed_commands:
             chunks.append("[failed_commands]\n" + "\n".join(f"- {item}" for item in failed_commands[:6]))
         if rejected_actions:
-            chunks.append("[rejected_actions]\n" + "\n".join(f"- {item}" for item in rejected_actions[:4]))
+            chunks.append("[rejected_actions]\n" + "\n".join(f"- {item}" for item in rejected_actions[:6]))
         if not chunks:
             return "No previous failed/rejected repair actions."
         return "\n\n".join(chunks)
@@ -954,9 +970,13 @@ class AgentOrchestrator:
         for action in actions:
             action_type = (action.action_type or "").strip().lower()
             if action_type == "replace_text_in_file":
-                if (action.replace_text or "").strip():
-                    return True
-                continue
+                ft_raw = action.find_text or ""
+                rt_raw = action.replace_text if action.replace_text is not None else ""
+                if not ft_raw.strip():
+                    continue
+                if ft_raw == rt_raw:
+                    continue
+                return True
             if action_type == "ensure_postgres_db":
                 return True
             if action_type == "update_healthcheck_url":
@@ -981,38 +1001,39 @@ class AgentOrchestrator:
                     return None
         return None
 
-    def _has_compose_fix_action(self, actions: list) -> bool:
-        for action in actions:
-            action_type = (action.action_type or "").strip().lower()
-            if action_type == "replace_text_in_file":
-                file_path = (action.file_path or "").lower()
-                if "docker-compose" in file_path or file_path.endswith("compose.yml"):
-                    return True
-            if action_type in {"run_remote_command", "run_local_command"}:
-                cmd = (action.command or "").lower()
-                if ("docker-compose.yml" in cmd or "docker compose" in cmd) and any(
-                    token in cmd for token in ("sed ", "awk ", "perl ", "python ", "yq ", "tee ")
-                ):
-                    return True
-        return False
+    def _resolve_compose_file(self, project_root: Path) -> Path | None:
+        for name in ("docker-compose.yml", "docker-compose.yaml", "compose.yml"):
+            candidate = project_root / name
+            if candidate.exists():
+                return candidate
+        return None
+
+    def _compose_file_fact_snippet(self, project_root: Path, limit: int = 8000) -> str | None:
+        path = self._resolve_compose_file(project_root)
+        if not path:
+            return None
+        return path.read_text(encoding="utf-8")[:limit]
+
+    def _count_compose_host_port_mappings(self, content: str, host_port: int) -> int:
+        host_ports = re.findall(r"['\"]?(\d+)\s*:\s*\d+['\"]?", content)
+        return sum(1 for port in host_ports if port == str(host_port))
 
     def _assert_single_host_port_mapping(self, project_root: Path, run_id: str, host_port: int) -> bool:
-        compose_file = project_root / "docker-compose.yml"
-        if not compose_file.exists():
+        compose_file = self._resolve_compose_file(project_root)
+        if not compose_file:
             storage.add_event(
                 run_id,
                 "repair",
-                "Post-condition check skipped: docker-compose.yml missing in project root.",
+                "Post-condition check skipped: no compose file in project root.",
             )
             return False
         content = compose_file.read_text(encoding="utf-8")
-        host_ports = re.findall(r"['\"]?(\d+)\s*:\s*\d+['\"]?", content)
-        count = sum(1 for port in host_ports if port == str(host_port))
+        count = self._count_compose_host_port_mappings(content, host_port)
         storage.add_event(
             run_id,
             "repair",
             "Post-condition check executed for compose host-port uniqueness.",
-            {"port": host_port, "count": count},
+            {"port": host_port, "count": count, "compose_file": compose_file.name},
         )
         return count == 1
 
