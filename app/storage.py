@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import threading
 import uuid
 from datetime import datetime
@@ -8,6 +9,8 @@ from typing import Dict, List
 
 from .config import settings
 from .models import AgentRun, ContextDocument, RunEvent, RunStatus
+
+logger = logging.getLogger("aiprogrammer")
 
 
 class InMemoryStorage:
@@ -57,10 +60,12 @@ class InMemoryStorage:
             run.updated_at = datetime.utcnow()
 
     def add_event(self, run_id: str, stage: str, message: str, payload: dict | None = None) -> None:
+        payload_data = payload or {}
         with self._lock:
             run = self._runs[run_id]
-            run.events.append(RunEvent(stage=stage, message=message, payload=payload or {}))
+            run.events.append(RunEvent(stage=stage, message=message, payload=payload_data))
             run.updated_at = datetime.utcnow()
+        logger.info("run=%s stage=%s message=%s payload=%s", run_id, stage, message, payload_data)
 
     def get_run(self, run_id: str) -> AgentRun:
         with self._lock:

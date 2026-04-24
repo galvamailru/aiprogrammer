@@ -61,6 +61,12 @@ docker compose up -d --build
 
 `http://localhost:8080`
 
+4. Watch runtime logs:
+
+```bash
+docker logs -f aiprogrammer
+```
+
 ## UI flow
 
 1. Upload markdown context files (`.md`)

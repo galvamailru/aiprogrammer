@@ -105,6 +105,13 @@ class AgentOrchestrator:
         else:
             result = self.runner.run_local(["git", "pull", "--ff-only"], cwd=project_root, timeout_sec=600)
             storage.add_event(run_id, "git", "Local repository pull executed.", payload=result.model_dump())
+            if not result.ok and "no such ref was fetched" in result.stderr_tail.lower():
+                storage.add_event(
+                    run_id,
+                    "git",
+                    "Remote default branch is missing. Continuing with local branch initialization.",
+                )
+                return
             if not result.ok:
                 raise RuntimeError(f"Local pull failed: {result.stderr_tail}")
 
@@ -135,7 +142,7 @@ class AgentOrchestrator:
             ["git", "commit", "-m", f"agent attempt {attempt}: auto implementation"],
         ]
         if settings.auto_git_push:
-            commands.append(["git", "push", "origin", settings.local_git_branch])
+            commands.append(["git", "push", "-u", "origin", "HEAD"])
         for command in commands:
             result = self.runner.run_local(command, cwd=root, timeout_sec=300)
             storage.add_event(run_id, "git", "Git command executed.", payload=result.model_dump())
