@@ -283,15 +283,27 @@ class DeepSeekClient:
             "Use docker compose, curl, wget, psql, etc. as appropriate to the stack described in the architecture. "
             "Do not use destructive operations (no rm -rf, no volume wipes, no mkfs). "
             "If the architecture's 'Deploy verification (final stage)' section is missing or too vague, infer minimal safe checks from Run requirements and Acceptance criteria. "
-            "Discover real service names and published ports from the stack: early commands should establish ground truth "
-            "(e.g. `docker compose ps`, `docker compose config --services`) before curls to specific URLs. "
-            "Do not invent service names or host ports; derive them from compose/architecture or from the output of those discovery commands within the same command list."
+            "HARD RULES (ground truth only): "
+            "(1) The first command in commands MUST be `docker compose ps` (with cd into the deploy directory as above). "
+            "Service names and published HOST ports for curl/wget MUST be taken only from that compose reality plus what is explicitly written in the architecture/task "
+            "(e.g. PORTS column `0.0.0.0:8086->80/tcp` means curl to `http://127.0.0.1:8086/...` on the deploy host). "
+            "Never invent ports such as 3000, 8080, or 5000 unless they literally appear in the architecture text or in the docker compose ps / compose file described there. "
+            "(2) HTTP paths for smoke checks MUST match API routes that are explicitly documented in the architecture markdown OR clearly named in the business task "
+            "(path literals, OpenAPI fragment, or 'Deploy verification' curl examples). "
+            "Do NOT assume a `/api/` prefix, `/api/tasks`, or generic SPA dev ports—if routes are not stated, use only compose ps, compose logs, and non-HTTP checks "
+            "until a path is justified by the spec. "
+            "(3) For `docker compose exec SERVICE curl http://localhost:PORT/...`, PORT must match how that SERVICE listens inside its container per architecture / "
+            "typical mapping in the spec (e.g. FastAPI uvicorn 8000)—never guess 3000 for a Python API container. "
+            "If curl may be missing in a slim image, prefer `wget -qO-` or hitting the published host port from ps instead of exec+curl. "
+            "(4) You may include `docker compose config --services` after ps; still no invented topology."
         )
         user_prompt = (
             f"Business task:\n{task_text}\n\n"
             f"Deploy directory on server (project root):\n{deploy_project_dir}\n\n"
             f"Approved architecture specification (markdown):\n{architecture_spec[:60000]}\n\n"
-            "Produce commands that prove the deployment works after docker compose up."
+            "Produce commands that prove the deployment works after docker compose up. "
+            "Anchor every curl URL to (a) host ports and service names shown by the first `docker compose ps` step in your own command list and "
+            "(b) HTTP paths that you can quote from the task or architecture above—no guessed frameworks."
         )
         raw = await self._chat(system_prompt, user_prompt)
         parsed = self._parse_json_relaxed(raw)

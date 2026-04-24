@@ -46,8 +46,16 @@
 
     <section class="card">
       <h2>2b. Fix-only run (no architect draft)</h2>
-      <p class="subtitle">Minimal-diff pipeline: same Git / deploy fields as above; optional contract TZ to preserve API shape.</p>
+      <p class="subtitle">Minimal-diff pipeline. Здесь же укажите Git и каталог деплоя (не обязательно заполнять блок 2 выше).</p>
       <form id="fix-only-form">
+        <label for="fix-git-url">Git repository URL</label>
+        <input type="url" id="fix-git-url" placeholder="https://github.com/owner/repo.git" required>
+        <label for="fix-deploy-dir">Deploy directory on Linux server</label>
+        <input type="text" id="fix-deploy-dir" placeholder="/opt/myapp" required>
+        <label for="fix-use-repo-context">
+          <input type="checkbox" id="fix-use-repo-context" checked>
+          Use pulled Git code as model context
+        </label>
         <label for="fix-change-request">Change request</label>
         <textarea id="fix-change-request" rows="6" placeholder="e.g. Frontend calls /api/items but backend exposes /api/v1/items — align paths and types only." required></textarea>
         <label for="fix-contract-spec">Contract / TZ (optional, same role as approved architecture)</label>
@@ -268,12 +276,22 @@
     document.getElementById("fix-only-form").addEventListener("submit", async (event) => {
       event.preventDefault();
       const changeRequest = document.getElementById("fix-change-request").value.trim();
-      const gitUrl = document.getElementById("git-url").value.trim();
-      const deployDir = document.getElementById("deploy-dir").value.trim();
-      const useRepoContext = document.getElementById("use-repo-context").checked;
+      const gitUrl = (
+        document.getElementById("fix-git-url").value.trim()
+        || document.getElementById("git-url").value.trim()
+      );
+      const deployDir = (
+        document.getElementById("fix-deploy-dir").value.trim()
+        || document.getElementById("deploy-dir").value.trim()
+      );
+      const useRepoContext = document.getElementById("fix-use-repo-context").checked;
       const contract = document.getElementById("fix-contract-spec").value.trim();
-      if (!changeRequest || !gitUrl || !deployDir) {
-        alert("Change request, Git URL and deploy dir are required (reuse fields from section 2).");
+      const missing = [];
+      if (!changeRequest) missing.push("change request");
+      if (!gitUrl) missing.push("Git URL");
+      if (!deployDir) missing.push("deploy directory");
+      if (missing.length) {
+        alert(`Заполните: ${missing.join(", ")}.`);
         return;
       }
       const body = {
@@ -315,7 +333,9 @@
 
     async function bootstrap() {
       const config = await api("/api/config");
-      document.getElementById("deploy-dir").value = config.deploy_project_dir || "";
+      const deployDefault = config.deploy_project_dir || "";
+      document.getElementById("deploy-dir").value = deployDefault;
+      document.getElementById("fix-deploy-dir").value = deployDefault;
       document.getElementById("architect-prompt").value = config.architect_system_prompt || "";
       await loadContextDocs();
       await loadRuns();
