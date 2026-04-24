@@ -25,6 +25,8 @@
       <form id="task-form">
         <label for="git-url">Git repository URL</label>
         <input type="url" id="git-url" placeholder="https://github.com/owner/repo.git" required>
+        <button type="button" id="test-git-auth">Test Git auth</button>
+        <div id="git-auth-result"></div>
         <label for="deploy-dir">Deploy directory on Linux server</label>
         <input type="text" id="deploy-dir" placeholder="/opt/myapp" required>
         <textarea id="task-text" rows="8" placeholder="Describe business task and expected outcome..." required></textarea>
@@ -142,6 +144,27 @@
       });
       selectedRunId = result.run_id;
       await loadRuns();
+    });
+
+    document.getElementById("test-git-auth").addEventListener("click", async () => {
+      const gitUrl = document.getElementById("git-url").value.trim();
+      if (!gitUrl) {
+        alert("Fill Git URL first");
+        return;
+      }
+      const resultEl = document.getElementById("git-auth-result");
+      resultEl.textContent = "Testing...";
+      try {
+        const result = await api("/api/git-auth/test", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ git_url: gitUrl })
+        });
+        const status = result.ok ? "OK" : "FAILED";
+        resultEl.textContent = `Git auth test: ${status}. ${result.message}`;
+      } catch (error) {
+        resultEl.textContent = `Git auth test error: ${error.message}`;
+      }
     });
 
     async function bootstrap() {

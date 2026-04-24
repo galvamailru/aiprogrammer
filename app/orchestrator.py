@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import tempfile
+import time
 from pathlib import Path
 
 from .config import settings
@@ -174,8 +177,130 @@ class AgentOrchestrator:
                 if "nothing to commit" in commit_stderr or "nothing to commit" in commit_stdout:
                     continue
                 raise RuntimeError(f"Git commit failed: {result.stderr_tail}")
+            if not result.ok and command[:2] == ["git", "push"]:
+                push_result = self._push_with_https_token_if_available(root=root, run_id=run_id)
+                if push_result is not None:
+                    if push_result.ok:
+                        continue
+                    raise RuntimeError(f"Git push failed with token auth: {push_result.stderr_tail}")
             if not result.ok:
                 raise RuntimeError(f"Git flow failed: {result.stderr_tail}")
+
+    def _push_with_https_token_if_available(self, root: Path, run_id: str):
+        if not settings.github_token:
+            storage.add_event(run_id, "git", "GITHUB_TOKEN is not configured. Token push fallback skipped.")
+            return None
+
+        username = settings.github_username or "x-access-token"
+        askpass_path = root / ".git" / "aiprogrammer_askpass.sh"
+        askpass_content = (
+            "#!/bin/sh\n"
+            "case \"$1\" in\n"
+            "  *Username*) echo \"$GITHUB_USERNAME\" ;;\n"
+            "  *Password*) echo \"$GITHUB_TOKEN\" ;;\n"
+            "  *) echo \"\" ;;\n"
+            "esac\n"
+        )
+        askpass_path.write_text(askpass_content, encoding="utf-8")
+        os.chmod(askpass_path, 0o700)
+
+        env_overrides = {
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_ASKPASS": str(askpass_path),
+            "GITHUB_USERNAME": username,
+            "GITHUB_TOKEN": settings.github_token,
+        }
+        result = self.runner.run_local(
+            ["git", "push", "-u", "origin", "HEAD"],
+            cwd=root,
+            timeout_sec=300,
+            env_overrides=env_overrides,
+            display_command="git push -u origin HEAD (token auth)",
+        )
+        storage.add_event(run_id, "git", "Git token-auth push executed.", payload=result.model_dump())
+        try:
+            askpass_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return result
+
+    def test_git_auth(self, git_url: str) -> dict:
+        url = git_url.strip()
+        if not url:
+            raise RuntimeError("git_url is required.")
+
+        with tempfile.TemporaryDirectory(prefix="aiprog-git-auth-") as tmp_dir:
+            workdir = Path(tmp_dir)
+            branch_name = f"aiprogrammer-authcheck-{int(time.time())}"
+            steps = []
+
+            setup_commands = [
+                ["git", "init", "-b", "main"],
+                ["git", "config", "user.name", settings.git_author_name],
+                ["git", "config", "user.email", settings.git_author_email],
+                ["git", "remote", "add", "origin", url],
+            ]
+            for command in setup_commands:
+                result = self.runner.run_local(command, cwd=workdir, timeout_sec=60)
+                steps.append(result.model_dump())
+                if not result.ok:
+                    return {"ok": False, "message": "Git setup command failed.", "steps": steps}
+
+            marker = workdir / "AUTH_TEST.md"
+            marker.write_text("auth test\n", encoding="utf-8")
+            for command in [["git", "add", "."], ["git", "commit", "-m", "auth test commit"]]:
+                result = self.runner.run_local(command, cwd=workdir, timeout_sec=60)
+                steps.append(result.model_dump())
+                if not result.ok:
+                    return {"ok": False, "message": "Git commit failed during auth test.", "steps": steps}
+
+            push_command = ["git", "push", "--dry-run", "origin", f"HEAD:refs/heads/{branch_name}"]
+            result = self.runner.run_local(push_command, cwd=workdir, timeout_sec=120)
+            steps.append(result.model_dump())
+            if result.ok:
+                return {"ok": True, "message": "Git auth is valid for push dry-run.", "steps": steps}
+
+            token_result = self._push_with_https_token_if_available_for_test(root=workdir, branch_name=branch_name)
+            if token_result is not None:
+                steps.append(token_result.model_dump())
+                if token_result.ok:
+                    return {"ok": True, "message": "Git auth is valid using GITHUB_TOKEN.", "steps": steps}
+
+            return {"ok": False, "message": "Git auth test failed for push dry-run.", "steps": steps}
+
+    def _push_with_https_token_if_available_for_test(self, root: Path, branch_name: str):
+        if not settings.github_token:
+            return None
+        username = settings.github_username or "x-access-token"
+        askpass_path = root / ".git" / "aiprogrammer_askpass.sh"
+        askpass_content = (
+            "#!/bin/sh\n"
+            "case \"$1\" in\n"
+            "  *Username*) echo \"$GITHUB_USERNAME\" ;;\n"
+            "  *Password*) echo \"$GITHUB_TOKEN\" ;;\n"
+            "  *) echo \"\" ;;\n"
+            "esac\n"
+        )
+        askpass_path.write_text(askpass_content, encoding="utf-8")
+        os.chmod(askpass_path, 0o700)
+        env_overrides = {
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_ASKPASS": str(askpass_path),
+            "GITHUB_USERNAME": username,
+            "GITHUB_TOKEN": settings.github_token,
+        }
+        result = self.runner.run_local(
+            ["git", "push", "--dry-run", "origin", f"HEAD:refs/heads/{branch_name}"],
+            cwd=root,
+            timeout_sec=120,
+            env_overrides=env_overrides,
+            display_command="git push --dry-run origin HEAD:<branch> (token auth)",
+        )
+        try:
+            askpass_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return result
 
     async def _deploy_and_validate(self, run_id: str, git_url: str, deploy_project_dir: str) -> bool:
         if not git_url:

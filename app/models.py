@@ -43,6 +43,10 @@ class BusinessTaskRequest(BaseModel):
     deploy_project_dir: str | None = None
 
 
+class GitAuthTestRequest(BaseModel):
+    git_url: str
+
+
 class CodeFileProposal(BaseModel):
     path: str
     content: str

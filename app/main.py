@@ -9,7 +9,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from .config import settings
-from .models import BusinessTaskRequest
+from .models import BusinessTaskRequest, GitAuthTestRequest
 from .orchestrator import orchestrator
 from .storage import storage
 
@@ -72,6 +72,15 @@ async def create_run(payload: BusinessTaskRequest) -> dict:
         deploy_project_dir=payload.deploy_project_dir,
     )
     return {"ok": True, "run_id": run.run_id}
+
+
+@app.post("/api/git-auth/test")
+async def test_git_auth(payload: GitAuthTestRequest) -> dict:
+    git_url = payload.git_url.strip()
+    if not git_url:
+        raise HTTPException(status_code=400, detail="git_url cannot be empty.")
+    result = orchestrator.test_git_auth(git_url=git_url)
+    return result
 
 
 @app.get("/api/runs")

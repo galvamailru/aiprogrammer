@@ -33,6 +33,7 @@ Fill:
 - local project directory
 - deploy directory on server
 - git author identity for automated commits
+- GitHub credentials for HTTPS push from container (`GITHUB_USERNAME`, `GITHUB_TOKEN`)
 
 3. Run app:
 
@@ -71,7 +72,7 @@ docker logs -f aiprogrammer
 ## UI flow
 
 1. Upload markdown context files (`.md`)
-2. Set git repository URL
+2. Set git repository URL and run `Test Git auth`
 3. Set deploy directory on Linux server
 4. Enter business task and start run
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -15,11 +16,22 @@ def _tail(text: str, limit: int = 12000) -> str:
 
 
 class TerminalRunner:
-    def run_local(self, command: list[str], cwd: Path, timeout_sec: int = 300) -> CommandResult:
+    def run_local(
+        self,
+        command: list[str],
+        cwd: Path,
+        timeout_sec: int = 300,
+        env_overrides: dict[str, str] | None = None,
+        display_command: str | None = None,
+    ) -> CommandResult:
         t0 = time.time()
+        env = os.environ.copy()
+        if env_overrides:
+            env.update(env_overrides)
         proc = subprocess.run(
             command,
             cwd=str(cwd),
+            env=env,
             capture_output=True,
             text=True,
             timeout=timeout_sec,
@@ -29,7 +41,7 @@ class TerminalRunner:
         elapsed = round(time.time() - t0, 3)
         return CommandResult(
             ok=proc.returncode == 0,
-            command=" ".join(command),
+            command=display_command or " ".join(command),
             exit_code=proc.returncode,
             stdout_tail=_tail(proc.stdout),
             stderr_tail=_tail(proc.stderr),

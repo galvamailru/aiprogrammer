@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     max_fix_attempts: int = 3
     git_author_name: str = "AI Programmer Bot"
     git_author_email: str = "bot@example.com"
+    github_username: str = ""
+    github_token: str = ""
 
     app_host: str = "0.0.0.0"
     app_port: int = 8080
