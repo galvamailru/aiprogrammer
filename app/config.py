@@ -28,6 +28,12 @@ class Settings(BaseSettings):
     git_author_email: str = "bot@example.com"
     github_username: str = ""
     github_token: str = ""
+    architect_system_prompt: str = (
+        "You are a senior solution architect. "
+        "Return strict JSON with key: architecture_spec_markdown. "
+        "The markdown must include sections: Goal, Tech stack, Functional requirements, "
+        "Non-functional requirements, Project structure requirements, Run requirements, Acceptance criteria."
+    )
 
     app_host: str = "0.0.0.0"
     app_port: int = 8080

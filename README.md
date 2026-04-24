@@ -72,9 +72,12 @@ docker logs -f aiprogrammer
 ## UI flow
 
 1. Upload markdown context files (`.md`)
-2. Set git repository URL and run `Test Git auth`
-3. Set deploy directory on Linux server
-4. Enter business task and start run
+2. Set or edit architect agent prompt
+3. Enter business task and click `Generate TZ`
+4. Review/edit generated architecture TZ and confirm (`Согласовано`)
+5. Set git repository URL and run `Test Git auth`
+6. Set deploy directory on Linux server
+7. Start run after architecture approval
 
 ## Core architecture
 
@@ -87,6 +90,10 @@ docker logs -f aiprogrammer
 ## Notes
 
 - This is an MVP scaffold intended for controlled environments.
+- Auto-remediation rules are implemented for common deploy failures:
+  - `port is already allocated` -> compose down/remove-orphans + rebuild/up
+  - `database files are incompatible with server` -> compose down with volumes + rebuild/up
+  - `connection refused` -> remote fallback healthcheck by detected backend mapped port
 - For production, add:
   - secrets manager integration
   - RBAC and policy engine

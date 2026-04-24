@@ -69,6 +69,48 @@ class DeepSeekClient:
         except Exception:
             return self._fallback_code_plan(task_text)
 
+    async def build_architecture_spec(self, task_text: str, context_md: str, architect_prompt: str | None = None) -> str:
+        if not self._api_key:
+            return (
+                "# Project context\n\n"
+                "## Goal\n"
+                f"{task_text}\n\n"
+                "## Tech stack\n"
+                "- Python 3.11\n- FastAPI\n- Docker\n\n"
+                "## Functional requirements\n- Define core endpoints and expected behavior.\n\n"
+                "## Non-functional requirements\n- Basic reliability and readability.\n\n"
+                "## Project structure requirements\n- main application entrypoint and dependency file.\n\n"
+                "## Run requirements\n- Containerized startup command.\n\n"
+                "## Acceptance criteria\n- Main endpoint responds successfully."
+            )
+
+        system_prompt = architect_prompt.strip() if architect_prompt else settings.architect_system_prompt
+        user_prompt = (
+            f"Business task:\n{task_text}\n\n"
+            f"Context docs:\n{context_md}\n\n"
+            "Generate architecture specification markdown for implementation."
+        )
+        raw = await self._chat(system_prompt, user_prompt)
+        try:
+            parsed: dict[str, Any] = json.loads(raw)
+            spec = str(parsed.get("architecture_spec_markdown", "")).strip()
+            if spec:
+                return spec
+        except Exception:
+            pass
+        return (
+            "# Project context\n\n"
+            "## Goal\n"
+            f"{task_text}\n\n"
+            "## Tech stack\n"
+            "- Python 3.11\n- FastAPI\n- Docker\n\n"
+            "## Functional requirements\n- Define required API and behavior.\n\n"
+            "## Non-functional requirements\n- Stability and maintainability.\n\n"
+            "## Project structure requirements\n- Clear project layout and dependencies.\n\n"
+            "## Run requirements\n- Provide container startup flow.\n\n"
+            "## Acceptance criteria\n- Health endpoint returns success."
+        )
+
     async def review_and_fix_hint(self, task_text: str, last_error: str, context_md: str) -> str:
         if not self._api_key:
             return "Fallback review: inspect deployment logs and ensure docker compose services are healthy."

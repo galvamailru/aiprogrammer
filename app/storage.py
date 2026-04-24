@@ -34,7 +34,15 @@ class InMemoryStorage:
         with self._lock:
             return list(self._docs)
 
-    def create_run(self, task_text: str, max_attempts: int, git_url: str, deploy_project_dir: str) -> AgentRun:
+    def create_run(
+        self,
+        task_text: str,
+        max_attempts: int,
+        git_url: str,
+        deploy_project_dir: str,
+        architecture_spec: str = "",
+        architect_prompt: str = "",
+    ) -> AgentRun:
         run_id = uuid.uuid4().hex
         run = AgentRun(
             run_id=run_id,
@@ -42,6 +50,8 @@ class InMemoryStorage:
             max_attempts=max_attempts,
             git_url=git_url,
             deploy_project_dir=deploy_project_dir,
+            architecture_spec=architecture_spec,
+            architect_prompt=architect_prompt,
         )
         with self._lock:
             self._runs[run_id] = run

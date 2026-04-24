@@ -43,6 +43,19 @@ class BusinessTaskRequest(BaseModel):
     deploy_project_dir: str | None = None
 
 
+class ArchitectDraftRequest(BaseModel):
+    task_text: str
+    architect_prompt: str | None = None
+
+
+class ArchitectApproveRequest(BaseModel):
+    task_text: str
+    git_url: str | None = None
+    deploy_project_dir: str | None = None
+    architecture_spec: str
+    architect_prompt: str | None = None
+
+
 class GitAuthTestRequest(BaseModel):
     git_url: str
 
@@ -68,4 +81,6 @@ class AgentRun(BaseModel):
     max_attempts: int = 3
     git_url: str = ""
     deploy_project_dir: str = ""
+    architecture_spec: str = ""
+    architect_prompt: str = ""
     events: List[RunEvent] = Field(default_factory=list)

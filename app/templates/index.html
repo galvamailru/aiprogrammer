@@ -23,14 +23,20 @@
     <section class="card">
       <h2>2. Enter business task</h2>
       <form id="task-form">
+        <label for="architect-prompt">Architect agent prompt</label>
+        <textarea id="architect-prompt" rows="6" placeholder="Custom architect prompt..."></textarea>
         <label for="git-url">Git repository URL</label>
         <input type="url" id="git-url" placeholder="https://github.com/owner/repo.git" required>
         <button type="button" id="test-git-auth">Test Git auth</button>
         <div id="git-auth-result"></div>
         <label for="deploy-dir">Deploy directory on Linux server</label>
         <input type="text" id="deploy-dir" placeholder="/opt/myapp" required>
+        <label for="task-text">Business task</label>
         <textarea id="task-text" rows="8" placeholder="Describe business task and expected outcome..." required></textarea>
-        <button type="submit">Start agent cycle</button>
+        <button type="button" id="generate-arch-spec">Generate TZ</button>
+        <label for="architecture-spec">Architecture TZ (editable, approve before run)</label>
+        <textarea id="architecture-spec" rows="14" placeholder="Generated architecture specification will appear here..."></textarea>
+        <button type="submit">Согласовано: Start agent cycle</button>
       </form>
     </section>
 
@@ -135,18 +141,43 @@
       await loadContextDocs();
     });
 
+    document.getElementById("generate-arch-spec").addEventListener("click", async () => {
+      const taskText = document.getElementById("task-text").value.trim();
+      const architectPrompt = document.getElementById("architect-prompt").value.trim();
+      if (!taskText) {
+        alert("Fill business task first");
+        return;
+      }
+      const result = await api("/api/architect/draft", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          task_text: taskText,
+          architect_prompt: architectPrompt || null
+        })
+      });
+      document.getElementById("architecture-spec").value = result.architecture_spec || "";
+    });
+
     document.getElementById("task-form").addEventListener("submit", async (event) => {
       event.preventDefault();
       const taskText = document.getElementById("task-text").value.trim();
       const gitUrl = document.getElementById("git-url").value.trim();
       const deployDir = document.getElementById("deploy-dir").value.trim();
-      if (!taskText || !gitUrl || !deployDir) return;
+      const architectPrompt = document.getElementById("architect-prompt").value.trim();
+      const architectureSpec = document.getElementById("architecture-spec").value.trim();
+      if (!taskText || !gitUrl || !deployDir || !architectureSpec) {
+        alert("Task, git URL, deploy dir and approved TZ are required.");
+        return;
+      }
       const payload = JSON.stringify({
         task_text: taskText,
         git_url: gitUrl,
-        deploy_project_dir: deployDir
+        deploy_project_dir: deployDir,
+        architecture_spec: architectureSpec,
+        architect_prompt: architectPrompt || null
       });
-      const result = await api("/api/runs", {
+      const result = await api("/api/architect/approve-start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: payload
@@ -179,6 +210,7 @@
     async function bootstrap() {
       const config = await api("/api/config");
       document.getElementById("deploy-dir").value = config.deploy_project_dir || "";
+      document.getElementById("architect-prompt").value = config.architect_system_prompt || "";
       await loadContextDocs();
       await loadRuns();
       setInterval(loadRuns, 3000);

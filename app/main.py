@@ -9,7 +9,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from .config import settings
-from .models import BusinessTaskRequest, GitAuthTestRequest
+from .models import ArchitectApproveRequest, ArchitectDraftRequest, BusinessTaskRequest, GitAuthTestRequest
 from .orchestrator import orchestrator
 from .storage import storage
 
@@ -43,6 +43,7 @@ async def get_config() -> dict:
         "auto_git_push": settings.auto_git_push,
         "auto_deploy": settings.auto_deploy,
         "max_fix_attempts": settings.max_fix_attempts,
+        "architect_system_prompt": settings.architect_system_prompt,
     }
 
 
@@ -70,6 +71,33 @@ async def create_run(payload: BusinessTaskRequest) -> dict:
         task_text=task_text,
         git_url=payload.git_url,
         deploy_project_dir=payload.deploy_project_dir,
+    )
+    return {"ok": True, "run_id": run.run_id}
+
+
+@app.post("/api/architect/draft")
+async def draft_architecture(payload: ArchitectDraftRequest) -> dict:
+    task_text = payload.task_text.strip()
+    if not task_text:
+        raise HTTPException(status_code=400, detail="Task text cannot be empty.")
+    spec = await orchestrator.draft_architecture(task_text=task_text, architect_prompt=payload.architect_prompt)
+    return {"ok": True, "architecture_spec": spec}
+
+
+@app.post("/api/architect/approve-start")
+async def approve_and_start(payload: ArchitectApproveRequest) -> dict:
+    task_text = payload.task_text.strip()
+    architecture_spec = payload.architecture_spec.strip()
+    if not task_text:
+        raise HTTPException(status_code=400, detail="Task text cannot be empty.")
+    if not architecture_spec:
+        raise HTTPException(status_code=400, detail="Architecture specification cannot be empty.")
+    run = orchestrator.start_run(
+        task_text=task_text,
+        git_url=payload.git_url,
+        deploy_project_dir=payload.deploy_project_dir,
+        architecture_spec=architecture_spec,
+        architect_prompt=(payload.architect_prompt or "").strip(),
     )
     return {"ok": True, "run_id": run.run_id}
 

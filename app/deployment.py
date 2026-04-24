@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import time
 
 import httpx
@@ -40,6 +41,50 @@ class DeploymentService:
         safe_dir = deploy_project_dir.replace('"', "")
         command = f"cd \"{safe_dir}\" && docker compose logs --tail=200"
         return self.runner.run_ssh(command, timeout_sec=300)
+
+    def remediation_rules(self) -> list[dict]:
+        return [
+            {
+                "id": "port_allocated",
+                "signatures": ["port is already allocated", "bind for 0.0.0.0"],
+                "action": "docker compose down --remove-orphans && docker compose up -d --build",
+            },
+            {
+                "id": "pg_data_version_mismatch",
+                "signatures": ["database files are incompatible with server", "initialized by postgresql version"],
+                "action": "docker compose down --remove-orphans -v && docker compose up -d --build",
+            },
+            {
+                "id": "connection_refused_health",
+                "signatures": ["[errno 111] connection refused", "connection refused"],
+                "action": "check backend exposed port and use remote healthcheck fallback",
+            },
+        ]
+
+    def detect_remediation_rule(self, error_text: str) -> dict | None:
+        lowered = (error_text or "").lower()
+        for rule in self.remediation_rules():
+            if any(signature in lowered for signature in rule["signatures"]):
+                return rule
+        return None
+
+    def run_remediation(self, rule_id: str, deploy_project_dir: str) -> list[CommandResult]:
+        safe_dir = deploy_project_dir.replace('"', "")
+        if rule_id == "port_allocated":
+            return [
+                self.runner.run_ssh(f"cd \"{safe_dir}\" && docker compose down --remove-orphans", timeout_sec=600),
+                self.runner.run_ssh(f"cd \"{safe_dir}\" && docker compose up -d --build", timeout_sec=1800),
+            ]
+        if rule_id == "pg_data_version_mismatch":
+            return [
+                self.runner.run_ssh(f"cd \"{safe_dir}\" && docker compose down --remove-orphans -v", timeout_sec=600),
+                self.runner.run_ssh(f"cd \"{safe_dir}\" && docker compose up -d --build", timeout_sec=1800),
+            ]
+        if rule_id == "connection_refused_health":
+            return [
+                self.runner.run_ssh(f"cd \"{safe_dir}\" && docker compose ps", timeout_sec=120),
+            ]
+        return []
 
     def validate_remote_runtime(self, deploy_project_dir: str) -> list[CommandResult]:
         safe_dir = deploy_project_dir.replace('"', "")
@@ -107,6 +152,7 @@ class DeploymentService:
         return checks
 
     def healthcheck(self) -> CommandResult:
+        # Keep local HTTP fallback for compatibility, but primary check should be remote.
         deadline = time.time() + settings.healthcheck_timeout_seconds
         last_error = ""
         while time.time() < deadline:
@@ -135,3 +181,55 @@ class DeploymentService:
             duration_sec=float(settings.healthcheck_timeout_seconds),
             source="http",
         )
+
+    def healthcheck_remote(self, deploy_project_dir: str) -> CommandResult:
+        safe_dir = deploy_project_dir.replace('"', "")
+        deadline = time.time() + settings.healthcheck_timeout_seconds
+        while time.time() < deadline:
+            result = self.runner.run_ssh(
+                (
+                    f"cd \"{safe_dir}\" && "
+                    f"curl -fsS --max-time 10 \"{settings.healthcheck_url}\""
+                ),
+                timeout_sec=30,
+            )
+            if result.ok:
+                result.command = f"REMOTE GET {settings.healthcheck_url}"
+                return result
+            time.sleep(5)
+        return CommandResult(
+            ok=False,
+            command=f"REMOTE GET {settings.healthcheck_url}",
+            exit_code=1,
+            stdout_tail="",
+            stderr_tail="Remote healthcheck timed out or failed.",
+            duration_sec=float(settings.healthcheck_timeout_seconds),
+            source="ssh-http",
+        )
+
+    def healthcheck_remote_backend_fallback(self, deploy_project_dir: str) -> CommandResult:
+        safe_dir = deploy_project_dir.replace('"', "")
+        ps = self.runner.run_ssh(f"cd \"{safe_dir}\" && docker compose ps", timeout_sec=120)
+        if not ps.ok:
+            return ps
+
+        content = f"{ps.stdout_tail}\n{ps.stderr_tail}"
+        port_match = re.search(r"0\.0\.0\.0:(\d+)->8000/tcp", content)
+        if not port_match:
+            return CommandResult(
+                ok=False,
+                command="remote backend fallback healthcheck",
+                exit_code=1,
+                stdout_tail=content[-4000:],
+                stderr_tail="Unable to detect mapped backend port from docker compose ps.",
+                duration_sec=0.0,
+                source="analyzer",
+            )
+
+        mapped_port = port_match.group(1)
+        check = self.runner.run_ssh(
+            f"curl -fsS --max-time 10 \"http://127.0.0.1:{mapped_port}/health\"",
+            timeout_sec=30,
+        )
+        check.command = f"REMOTE GET http://127.0.0.1:{mapped_port}/health"
+        return check

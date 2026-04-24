@@ -20,7 +20,14 @@ class AgentOrchestrator:
         self.runner = TerminalRunner()
         self.deployment = DeploymentService(self.runner)
 
-    def start_run(self, task_text: str, git_url: str | None = None, deploy_project_dir: str | None = None) -> AgentRun:
+    def start_run(
+        self,
+        task_text: str,
+        git_url: str | None = None,
+        deploy_project_dir: str | None = None,
+        architecture_spec: str = "",
+        architect_prompt: str = "",
+    ) -> AgentRun:
         effective_git_url = (git_url or "").strip()
         effective_deploy_dir = (deploy_project_dir or settings.deploy_project_dir).strip()
         run = storage.create_run(
@@ -28,8 +35,17 @@ class AgentOrchestrator:
             max_attempts=settings.max_fix_attempts,
             git_url=effective_git_url,
             deploy_project_dir=effective_deploy_dir,
+            architecture_spec=architecture_spec,
+            architect_prompt=architect_prompt,
         )
         storage.add_event(run.run_id, "intake", "Task accepted and queued.")
+        if architecture_spec.strip():
+            storage.add_event(
+                run.run_id,
+                "architecture",
+                "Architecture TZ approved and attached to run context.",
+                {"chars": len(architecture_spec)},
+            )
         storage.update_status(run.run_id, RunStatus.running)
         asyncio.create_task(self._run_pipeline(run.run_id))
         return run
@@ -38,6 +54,10 @@ class AgentOrchestrator:
         run = storage.get_run(run_id)
         docs = storage.list_documents()
         context_md = "\n\n".join([f"## {doc.name}\n{doc.content}" for doc in docs])[:50000]
+        if run.architecture_spec.strip():
+            context_md = (
+                f"{context_md}\n\n## Approved architecture specification\n{run.architecture_spec.strip()}"
+            ).strip()
         project_root = settings.local_project_path
         project_root.mkdir(parents=True, exist_ok=True)
         storage.add_event(run_id, "pipeline", "Pipeline started.", {"project_root": str(project_root)})
@@ -71,6 +91,14 @@ class AgentOrchestrator:
             except Exception as exc:
                 error_msg = str(exc)
                 storage.add_event(run_id, "error", "Pipeline step failed.", {"error": error_msg})
+                remediation_applied = self._try_auto_remediation(
+                    run_id=run_id,
+                    error_msg=error_msg,
+                    deploy_project_dir=run.deploy_project_dir,
+                )
+                if remediation_applied:
+                    storage.add_event(run_id, "remediation", "Auto-remediation succeeded. Continuing without regeneration.")
+                    continue
                 if attempt == run.max_attempts:
                     storage.update_status(run_id, RunStatus.failed)
                     storage.add_event(run_id, "failed", "Max attempts reached.")
@@ -302,6 +330,15 @@ class AgentOrchestrator:
             pass
         return result
 
+    async def draft_architecture(self, task_text: str, architect_prompt: str | None = None) -> str:
+        docs = storage.list_documents()
+        context_md = "\n\n".join([f"## {doc.name}\n{doc.content}" for doc in docs])[:50000]
+        return await self.deepseek.build_architecture_spec(
+            task_text=task_text,
+            context_md=context_md,
+            architect_prompt=architect_prompt,
+        )
+
     async def _deploy_and_validate(self, run_id: str, git_url: str, deploy_project_dir: str) -> bool:
         if not git_url:
             raise RuntimeError("Deploy requires git_url from UI.")
@@ -319,13 +356,52 @@ class AgentOrchestrator:
             if not check.ok:
                 raise RuntimeError(check.stderr_tail or check.stdout_tail or "Runtime validation failed.")
 
-        health = self.deployment.healthcheck()
+        health = self.deployment.healthcheck_remote(deploy_project_dir=deploy_project_dir)
         storage.add_event(run_id, "health", "Healthcheck completed.", payload=health.model_dump())
         if not health.ok:
+            fallback = self.deployment.healthcheck_remote_backend_fallback(deploy_project_dir=deploy_project_dir)
+            storage.add_event(run_id, "health", "Healthcheck fallback executed.", payload=fallback.model_dump())
+            if fallback.ok:
+                return True
             logs = self.deployment.fetch_remote_logs(deploy_project_dir=deploy_project_dir)
             storage.add_event(run_id, "health", "Healthcheck failed, logs captured.", payload=logs.model_dump())
             raise RuntimeError(health.stderr_tail or "Healthcheck failed.")
         return True
+
+    def _try_auto_remediation(self, run_id: str, error_msg: str, deploy_project_dir: str) -> bool:
+        rule = self.deployment.detect_remediation_rule(error_msg)
+        if not rule:
+            storage.add_event(run_id, "remediation", "No remediation rule matched.")
+            return False
+
+        storage.add_event(
+            run_id,
+            "remediation",
+            "Matched remediation rule.",
+            {"rule_id": rule["id"], "action": rule["action"]},
+        )
+        actions = self.deployment.run_remediation(rule_id=rule["id"], deploy_project_dir=deploy_project_dir)
+        if not actions:
+            return False
+        for action_result in actions:
+            storage.add_event(run_id, "remediation", "Remediation command executed.", payload=action_result.model_dump())
+            if not action_result.ok:
+                return False
+
+        runtime_checks = self.deployment.validate_remote_runtime(deploy_project_dir=deploy_project_dir)
+        for check in runtime_checks:
+            storage.add_event(run_id, "remediation", "Post-remediation runtime check.", payload=check.model_dump())
+            if not check.ok:
+                return False
+
+        health = self.deployment.healthcheck_remote(deploy_project_dir=deploy_project_dir)
+        storage.add_event(run_id, "remediation", "Post-remediation healthcheck.", payload=health.model_dump())
+        if health.ok:
+            return True
+
+        fallback = self.deployment.healthcheck_remote_backend_fallback(deploy_project_dir=deploy_project_dir)
+        storage.add_event(run_id, "remediation", "Post-remediation fallback healthcheck.", payload=fallback.model_dump())
+        return fallback.ok
 
 
 orchestrator = AgentOrchestrator()
