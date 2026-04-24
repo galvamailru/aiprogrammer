@@ -94,6 +94,11 @@ docker logs -f aiprogrammer
   - `port is already allocated` -> compose down/remove-orphans + rebuild/up
   - `database files are incompatible with server` -> compose down with volumes + rebuild/up
   - `connection refused` -> remote fallback healthcheck by detected backend mapped port
+- LLM repair contract (`RepairAction`) is implemented for non-matching failures:
+  - `run_remote_command`
+  - `run_local_command`
+  - `replace_text_in_file`
+  - `update_healthcheck_url`
 - For production, add:
   - secrets manager integration
   - RBAC and policy engine

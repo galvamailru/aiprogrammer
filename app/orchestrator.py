@@ -9,7 +9,7 @@ from pathlib import Path
 from .config import settings
 from .deepseek_client import DeepSeekClient
 from .deployment import DeploymentService
-from .models import AgentRun, CodePlan, RunStatus
+from .models import AgentRun, CodePlan, RepairPlan, RunStatus
 from .storage import storage
 from .terminal_runner import TerminalRunner
 
@@ -98,6 +98,16 @@ class AgentOrchestrator:
                 )
                 if remediation_applied:
                     storage.add_event(run_id, "remediation", "Auto-remediation succeeded. Continuing without regeneration.")
+                    continue
+                llm_repair_applied = await self._try_llm_repair(
+                    run_id=run_id,
+                    run=run,
+                    error_msg=error_msg,
+                    context_md=context_md,
+                    project_root=project_root,
+                )
+                if llm_repair_applied:
+                    storage.add_event(run_id, "repair", "LLM repair succeeded. Continuing with next validation cycle.")
                     continue
                 if attempt == run.max_attempts:
                     storage.update_status(run_id, RunStatus.failed)
@@ -402,6 +412,103 @@ class AgentOrchestrator:
         fallback = self.deployment.healthcheck_remote_backend_fallback(deploy_project_dir=deploy_project_dir)
         storage.add_event(run_id, "remediation", "Post-remediation fallback healthcheck.", payload=fallback.model_dump())
         return fallback.ok
+
+    async def _try_llm_repair(
+        self,
+        run_id: str,
+        run: AgentRun,
+        error_msg: str,
+        context_md: str,
+        project_root: Path,
+    ) -> bool:
+        runtime_facts = self._collect_runtime_facts(deploy_project_dir=run.deploy_project_dir)
+        plan: RepairPlan = await self.deepseek.propose_repair_plan(
+            task_text=run.task_text,
+            last_error=error_msg,
+            context_md=context_md,
+            runtime_facts=runtime_facts,
+        )
+        storage.add_event(run_id, "repair", "LLM repair plan received.", payload=plan.model_dump())
+        if not plan.actions:
+            return False
+
+        for action in plan.actions:
+            action_type = (action.action_type or "").strip().lower()
+            if action_type == "run_remote_command":
+                result = self.runner.run_ssh(action.command, timeout_sec=900)
+                storage.add_event(run_id, "repair", "Repair action executed.", payload=result.model_dump())
+                if not result.ok:
+                    return False
+                continue
+
+            if action_type == "run_local_command":
+                cmd = action.command.strip()
+                if not cmd:
+                    return False
+                result = self.runner.run_local(["sh", "-lc", cmd], cwd=project_root, timeout_sec=900)
+                storage.add_event(run_id, "repair", "Repair action executed.", payload=result.model_dump())
+                if not result.ok:
+                    return False
+                continue
+
+            if action_type == "replace_text_in_file":
+                ok = self._apply_replace_text_action(project_root, action.file_path, action.find_text, action.replace_text)
+                storage.add_event(
+                    run_id,
+                    "repair",
+                    "Repair file patch applied.",
+                    {"ok": ok, "file_path": action.file_path, "action_type": action_type},
+                )
+                if not ok:
+                    return False
+                continue
+
+            if action_type == "update_healthcheck_url":
+                storage.add_event(
+                    run_id,
+                    "repair",
+                    "Healthcheck URL update requested; using remote fallback validation in current run.",
+                    {"requested_target": action.target, "action_type": action_type},
+                )
+                continue
+
+            storage.add_event(
+                run_id,
+                "repair",
+                "Unsupported repair action type.",
+                {"action_type": action_type},
+            )
+            return False
+
+        if run.git_url:
+            self._run_git_flow(project_root, run_id, attempt=run.current_attempt or 1)
+
+        if settings.auto_deploy:
+            return await self._deploy_and_validate(run_id, run.git_url, run.deploy_project_dir)
+        return True
+
+    def _collect_runtime_facts(self, deploy_project_dir: str) -> str:
+        facts: list[str] = []
+        ps = self.runner.run_ssh(f"cd \"{deploy_project_dir}\" && docker compose ps", timeout_sec=120)
+        logs = self.deployment.fetch_remote_logs(deploy_project_dir=deploy_project_dir)
+        facts.append(f"[compose_ps]\n{ps.stdout_tail}\n{ps.stderr_tail}")
+        facts.append(f"[compose_logs]\n{logs.stdout_tail}\n{logs.stderr_tail}")
+        return "\n\n".join(facts)
+
+    def _apply_replace_text_action(self, project_root: Path, file_path: str, find_text: str, replace_text: str) -> bool:
+        if not file_path:
+            return False
+        target = (project_root / file_path).resolve()
+        if project_root not in target.parents and target != project_root:
+            return False
+        if not target.exists():
+            return False
+        content = target.read_text(encoding="utf-8")
+        if find_text not in content:
+            return False
+        updated = content.replace(find_text, replace_text, 1)
+        target.write_text(updated, encoding="utf-8")
+        return True
 
 
 orchestrator = AgentOrchestrator()

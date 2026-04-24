@@ -71,6 +71,24 @@ class CodePlan(BaseModel):
     local_commands: List[str] = Field(default_factory=list)
 
 
+class RepairAction(BaseModel):
+    action_type: str
+    target: str = ""
+    command: str = ""
+    file_path: str = ""
+    find_text: str = ""
+    replace_text: str = ""
+    reason: str = ""
+
+
+class RepairPlan(BaseModel):
+    diagnosis: str
+    confidence: float = 0.0
+    actions: List[RepairAction] = Field(default_factory=list)
+    expected_outcome: str = ""
+    validation_steps: List[str] = Field(default_factory=list)
+
+
 class AgentRun(BaseModel):
     run_id: str
     created_at: datetime = Field(default_factory=datetime.utcnow)

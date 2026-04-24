@@ -24,7 +24,7 @@
       <h2>2. Enter business task</h2>
       <form id="task-form">
         <label for="architect-prompt">Architect agent prompt</label>
-        <textarea id="architect-prompt" rows="6" placeholder="Custom architect prompt..."></textarea>
+        <textarea id="architect-prompt" rows="6" placeholder="Custom architect prompt...">{{ architect_system_prompt }}</textarea>
         <label for="git-url">Git repository URL</label>
         <input type="url" id="git-url" placeholder="https://github.com/owner/repo.git" required>
         <button type="button" id="test-git-auth">Test Git auth</button>

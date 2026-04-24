@@ -6,7 +6,7 @@ from typing import Any
 import httpx
 
 from .config import settings
-from .models import CodePlan, CodeFileProposal
+from .models import CodePlan, CodeFileProposal, RepairPlan
 
 
 class DeepSeekClient:
@@ -124,3 +124,46 @@ class DeepSeekClient:
             return str(parsed.get("fix_hint", "No fix hint provided."))
         except Exception:
             return "Failed to parse review response. Check logs and deployment steps."
+
+    async def propose_repair_plan(
+        self,
+        task_text: str,
+        last_error: str,
+        context_md: str,
+        runtime_facts: str,
+    ) -> RepairPlan:
+        if not self._api_key:
+            return RepairPlan(
+                diagnosis="Fallback repair plan without model.",
+                confidence=0.2,
+                actions=[],
+                expected_outcome="No actions generated in fallback mode.",
+                validation_steps=[],
+            )
+
+        system_prompt = (
+            "You are an autonomous SRE+backend repair agent. "
+            "Return strict JSON with keys: diagnosis, confidence, actions, expected_outcome, validation_steps. "
+            "actions is array of objects with keys: action_type, target, command, file_path, find_text, replace_text, reason. "
+            "Allowed action_type values: run_remote_command, run_local_command, replace_text_in_file, update_healthcheck_url. "
+            "Prefer minimal reversible changes."
+        )
+        user_prompt = (
+            f"Business task:\n{task_text}\n\n"
+            f"Error:\n{last_error}\n\n"
+            f"Runtime facts:\n{runtime_facts}\n\n"
+            f"Context docs:\n{context_md}\n\n"
+            "Generate a repair plan."
+        )
+        raw = await self._chat(system_prompt, user_prompt)
+        try:
+            parsed: dict[str, Any] = json.loads(raw)
+            return RepairPlan(**parsed)
+        except Exception:
+            return RepairPlan(
+                diagnosis="Failed to parse repair plan JSON.",
+                confidence=0.1,
+                actions=[],
+                expected_outcome="No executable repair actions.",
+                validation_steps=[],
+            )

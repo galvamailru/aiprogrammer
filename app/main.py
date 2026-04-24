@@ -30,7 +30,7 @@ async def index(request: Request) -> HTMLResponse:
     return templates.TemplateResponse(
         request=request,
         name="index.html",
-        context={},
+        context={"architect_system_prompt": settings.architect_system_prompt},
     )
 
 
