@@ -95,6 +95,11 @@ class DeepSeekClient:
                 return False, f"actions[{idx}].action_type is invalid"
             if action_type in {"run_remote_command", "run_local_command"} and not str(action.get("command", "")).strip():
                 return False, f"actions[{idx}].command is required for {action_type}"
+            if action_type == "run_local_command":
+                cmd = str(action.get("command", "")).strip().lower()
+                # In this orchestrator, repair loop targets deployed environment.
+                # Local commands frequently create loops and should not be used.
+                return False, f"actions[{idx}].run_local_command is not allowed in repair plans (use run_remote_command): {cmd}"
             if action_type == "replace_text_in_file":
                 if not str(action.get("file_path", "")).strip():
                     return False, f"actions[{idx}].file_path is required for replace_text_in_file"
@@ -245,7 +250,8 @@ class DeepSeekClient:
             "Required top-level keys: diagnosis(string), confidence(number 0..1), actions(array), expected_outcome(string), validation_steps(array of strings). "
             "Each action must include: action_type, target, command, file_path, find_text, replace_text, reason. "
             "Allowed action_type values: run_remote_command, run_local_command, replace_text_in_file, update_healthcheck_url, ensure_postgres_db. "
-            "Prefer run_remote_command for deployment/runtime issues; use run_local_command only for local repository edits. "
+            "Use run_remote_command for diagnostics and runtime/deployment actions. "
+            "Do NOT use run_local_command in repair plans. "
             "When editing files, file_path must be relative to repository root (e.g., docker-compose.yml), not absolute remote paths. "
             "Use 'docker compose' syntax (not docker-compose) and avoid hardcoded container names when compose commands are possible. "
             "Do not repeat commands that already failed in recent_repair_feedback unless you explain why the preconditions changed. "

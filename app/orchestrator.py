@@ -689,15 +689,9 @@ class AgentOrchestrator:
                 cmd = action.command.strip()
                 if not cmd:
                     return False
-                if "docker compose" in cmd or "docker-compose" in cmd:
-                    storage.add_event(
-                        run_id,
-                        "repair",
-                        "Repair action rejected: docker compose should run remotely, not locally.",
-                        payload=action.model_dump(),
-                    )
-                    return False
-                result = self.runner.run_local(["sh", "-lc", cmd], cwd=project_root, timeout_sec=900)
+                # Safety fallback: in repair loop all diagnostics/treatment should be remote.
+                # If model still returns run_local_command, execute it remotely to avoid dead loops.
+                result = self.runner.run_ssh(cmd, timeout_sec=900)
                 storage.add_event(run_id, "repair", "Repair action executed.", payload=result.model_dump())
                 if not result.ok:
                     return False
