@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import ast
 import json
+import re
 from typing import Any
 
 import httpx
@@ -48,18 +50,29 @@ class DeepSeekClient:
             return data["choices"][0]["message"]["content"]
 
     def _parse_json_relaxed(self, raw: str) -> dict[str, Any] | None:
+        if not raw:
+            return None
+        cleaned = raw.strip()
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
         try:
-            return json.loads(raw)
+            return json.loads(cleaned)
         except Exception:
             pass
-        start = raw.find("{")
-        end = raw.rfind("}")
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
         if start != -1 and end != -1 and end > start:
-            snippet = raw[start : end + 1]
+            snippet = cleaned[start : end + 1]
             try:
                 return json.loads(snippet)
             except Exception:
-                return None
+                try:
+                    # Some model outputs contain single quotes or python-like dicts.
+                    parsed_any = ast.literal_eval(snippet)
+                    if isinstance(parsed_any, dict):
+                        return parsed_any
+                except Exception:
+                    return None
         return None
 
     async def build_code_plan(self, task_text: str, context_md: str) -> CodePlan:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import tempfile
 import time
 from pathlib import Path
@@ -116,6 +117,19 @@ class AgentOrchestrator:
             except Exception as exc:
                 error_msg = str(exc)
                 storage.add_event(run_id, "error", "Pipeline step failed.", {"error": error_msg})
+                signature_repair_applied = await self._try_signature_repairs(
+                    run_id=run_id,
+                    run=run,
+                    error_msg=error_msg,
+                    project_root=project_root,
+                )
+                if signature_repair_applied:
+                    storage.add_event(
+                        run_id,
+                        "repair",
+                        "Deterministic signature-based repair succeeded. Continuing with next validation cycle.",
+                    )
+                    continue
                 storage.add_event(
                     run_id,
                     "repair",
@@ -558,6 +572,75 @@ class AgentOrchestrator:
 
         if settings.auto_deploy:
             return await self._deploy_and_validate(run_id, run.git_url, run.deploy_project_dir)
+        return True
+
+    async def _try_signature_repairs(
+        self,
+        run_id: str,
+        run: AgentRun,
+        error_msg: str,
+        project_root: Path,
+    ) -> bool:
+        lowered = (error_msg or "").lower()
+        runtime_facts = self._collect_runtime_facts(deploy_project_dir=run.deploy_project_dir).lower()
+        combined = f"{lowered}\n{runtime_facts}"
+
+        # Signature 1: host port 8080 already allocated -> force remap to required app port.
+        if "bind for 0.0.0.0:8080 failed: port is already allocated" in combined:
+            desired_port = self._extract_desired_public_port()
+            changed = self._rewrite_local_compose_port(project_root=project_root, host_port=desired_port)
+            storage.add_event(
+                run_id,
+                "repair",
+                "Signature matched: host port conflict on 8080.",
+                {"signature": "bind for 0.0.0.0:8080 failed", "target_host_port": desired_port, "local_changed": changed},
+            )
+            if not changed:
+                return False
+            if run.git_url:
+                self._run_git_flow(project_root, run_id, attempt=run.current_attempt or 1)
+            if settings.auto_deploy:
+                return await self._deploy_and_validate(run_id, run.git_url, run.deploy_project_dir)
+            return True
+
+        # Signature 2: postgres database missing -> create target DB in existing db container.
+        if "database \"taskcalendar\" does not exist" in combined:
+            cmd = (
+                f"cd \"{run.deploy_project_dir}\" && "
+                "docker compose exec -T db sh -lc "
+                "\"psql -U $POSTGRES_USER -d postgres -tc \\\"SELECT 1 FROM pg_database WHERE datname='taskcalendar'\\\" "
+                "| grep -q 1 || psql -U $POSTGRES_USER -d postgres -c \\\"CREATE DATABASE taskcalendar;\\\"\""
+            )
+            result = self.runner.run_ssh(cmd, timeout_sec=300)
+            storage.add_event(run_id, "repair", "Signature repair command executed.", payload=result.model_dump())
+            if not result.ok:
+                return False
+            if settings.auto_deploy:
+                return await self._deploy_and_validate(run_id, run.git_url, run.deploy_project_dir)
+            return True
+
+        return False
+
+    def _extract_desired_public_port(self) -> int:
+        match = re.search(r":(\d+)", settings.healthcheck_url or "")
+        if match:
+            try:
+                return int(match.group(1))
+            except ValueError:
+                pass
+        return settings.app_port
+
+    def _rewrite_local_compose_port(self, project_root: Path, host_port: int) -> bool:
+        compose_file = project_root / "docker-compose.yml"
+        if not compose_file.exists():
+            return False
+        content = compose_file.read_text(encoding="utf-8")
+        updated = content
+        updated = re.sub(r'"\s*8080\s*:\s*80\s*"', f'"{host_port}:80"', updated)
+        updated = re.sub(r'"\s*8080\s*:\s*8080\s*"', f'"{host_port}:8080"', updated)
+        if updated == content:
+            return False
+        compose_file.write_text(updated, encoding="utf-8")
         return True
 
     def _collect_runtime_facts(self, deploy_project_dir: str) -> str:
