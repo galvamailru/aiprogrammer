@@ -32,6 +32,7 @@ Fill:
 - Linux server credentials
 - local project directory
 - deploy directory on server
+- git author identity for automated commits
 
 3. Run app:
 

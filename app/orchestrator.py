@@ -103,17 +103,37 @@ class AgentOrchestrator:
             if not result.ok:
                 raise RuntimeError(f"Local clone failed: {result.stderr_tail}")
         else:
-            result = self.runner.run_local(["git", "pull", "--ff-only"], cwd=project_root, timeout_sec=600)
-            storage.add_event(run_id, "git", "Local repository pull executed.", payload=result.model_dump())
-            if not result.ok and "no such ref was fetched" in result.stderr_tail.lower():
+            if not self._local_remote_has_heads(project_root=project_root, run_id=run_id):
                 storage.add_event(
                     run_id,
                     "git",
-                    "Remote default branch is missing. Continuing with local branch initialization.",
+                    "Remote repository has no branches yet. Pull skipped for bootstrap.",
                 )
                 return
+            result = self.runner.run_local(["git", "pull", "--ff-only"], cwd=project_root, timeout_sec=600)
+            storage.add_event(run_id, "git", "Local repository pull executed.", payload=result.model_dump())
             if not result.ok:
                 raise RuntimeError(f"Local pull failed: {result.stderr_tail}")
+
+    def _local_remote_has_heads(self, project_root: Path, run_id: str) -> bool:
+        probe = self.runner.run_local(
+            ["git", "ls-remote", "--exit-code", "--heads", "origin"],
+            cwd=project_root,
+            timeout_sec=120,
+        )
+        storage.add_event(run_id, "git", "Checked remote branches for local repository.", payload=probe.model_dump())
+        return probe.ok
+
+    def _ensure_git_identity(self, root: Path, run_id: str) -> None:
+        commands = [
+            ["git", "config", "user.name", settings.git_author_name],
+            ["git", "config", "user.email", settings.git_author_email],
+        ]
+        for command in commands:
+            result = self.runner.run_local(command, cwd=root, timeout_sec=60)
+            storage.add_event(run_id, "git", "Git identity command executed.", payload=result.model_dump())
+            if not result.ok:
+                raise RuntimeError(f"Failed to configure git identity: {result.stderr_tail}")
 
     def _materialize_files(self, root: Path, code_plan: CodePlan, run_id: str) -> None:
         storage.add_event(run_id, "plan", "Implementation plan generated.", {"summary": code_plan.summary})
@@ -137,18 +157,23 @@ class AgentOrchestrator:
                 raise RuntimeError(f"Local verification failed: {result.stderr_tail}")
 
     def _run_git_flow(self, root: Path, run_id: str, attempt: int) -> None:
+        self._ensure_git_identity(root=root, run_id=run_id)
         commands = [
             ["git", "add", "."],
             ["git", "commit", "-m", f"agent attempt {attempt}: auto implementation"],
         ]
         if settings.auto_git_push:
+            commands.append(["git", "branch", "-M", settings.local_git_branch])
             commands.append(["git", "push", "-u", "origin", "HEAD"])
         for command in commands:
             result = self.runner.run_local(command, cwd=root, timeout_sec=300)
             storage.add_event(run_id, "git", "Git command executed.", payload=result.model_dump())
-            if command[1] == "commit" and result.exit_code != 0:
-                # no-op commit is acceptable in repeated attempts
-                continue
+            if len(command) > 1 and command[1] == "commit" and result.exit_code != 0:
+                commit_stderr = result.stderr_tail.lower()
+                commit_stdout = result.stdout_tail.lower()
+                if "nothing to commit" in commit_stderr or "nothing to commit" in commit_stdout:
+                    continue
+                raise RuntimeError(f"Git commit failed: {result.stderr_tail}")
             if not result.ok:
                 raise RuntimeError(f"Git flow failed: {result.stderr_tail}")
 

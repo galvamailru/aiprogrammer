@@ -24,6 +24,8 @@ class Settings(BaseSettings):
     auto_git_push: bool = False
     auto_deploy: bool = True
     max_fix_attempts: int = 3
+    git_author_name: str = "AI Programmer Bot"
+    git_author_email: str = "bot@example.com"
 
     app_host: str = "0.0.0.0"
     app_port: int = 8080

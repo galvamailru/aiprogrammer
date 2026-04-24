@@ -20,7 +20,10 @@ class DeploymentService:
             (
                 f"if [ ! -d \"{safe_dir}/.git\" ]; then "
                 f"mkdir -p \"{safe_dir}\" && git clone \"{safe_repo}\" \"{safe_dir}\"; "
-                f"else cd \"{safe_dir}\" && git fetch --all && git pull --ff-only; fi"
+                f"else cd \"{safe_dir}\" && "
+                f"if git ls-remote --exit-code --heads origin >/dev/null 2>&1; then "
+                f"git fetch --all && git pull --ff-only; "
+                f"else echo 'Remote has no branches yet, pull skipped.'; fi; fi"
             ),
             f"cd \"{safe_dir}\" && docker compose up -d --build",
             f"cd \"{safe_dir}\" && docker compose ps",
